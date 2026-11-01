@@ -1,7 +1,7 @@
 "use strict";
 exports.default = Screen;
 
-var CHANNEL = "bridge_hub2.service";
+var CHANNEL = "bridge_hub.service";
 var __qrWatch = false;
 var __qrLoading = false;
 
