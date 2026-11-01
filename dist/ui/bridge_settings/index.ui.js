@@ -863,6 +863,7 @@ function Screen(ctx) {
                     TXT({ text: "作者 lihe233", style: "labelSmall", color: "onSurfaceVariant" }),
                     TXT({ text: "版 本 " + ((st && st.ver) || "-"), style: "labelSmall", color: "onSurfaceVariant" }),
                     TXT({ text: "把微信 / QQ / 本机 API 三类通道接入 Operit 对话，统一收发与回复回传，并对外提供 OpenAI 兼容网关。", style: "labelSmall", color: "onSurfaceVariant" }),
+                    aboutLink("项目", "https://github.com/lihe233/bridge-hub"),
                     aboutLink("主页", "https://github.com/lihe233"),
                     aboutLink("B 站", "https://b23.tv/vqqqZLO")
                 ])
