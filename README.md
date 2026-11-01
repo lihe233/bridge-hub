@@ -3,6 +3,8 @@
 把 **微信 / QQ / 本机 API** 三类通道接入 Operit 对话，统一收发、自动回复回传，并对外提供 OpenAI 兼容网关。
 
 > Operit ToolPkg，API 2.0.0
+  
+仓库：https://github.com/lihe233/bridge-hub
 
 ---
 
