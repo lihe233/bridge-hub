@@ -1,0 +1,28 @@
+# 运行时数据（包含真实凭证，绝不入库）
+accounts/
+typing/
+trash/
+.trash/
+
+# 日志
+*.log
+rt.log
+wxpoll.log
+rt_plugin.log
+
+# 生成的脚本与状态
+gw.py
+wxpoll.py
+gw_ports.json
+run_state.json
+seen.json
+typing_cache.json
+sync_buf.txt
+binding.json
+
+# 本地打包产物
+*.toolpkg
+
+# 系统文件
+.DS_Store
+Thumbs.db
