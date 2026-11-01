@@ -2,7 +2,7 @@
 # 打包为 .toolpkg（插件市场用）
 set -e
 VER=$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")
-OUT="/storage/emulated/0/Download/bridge_hub2-v${VER}.toolpkg"
+OUT="/storage/emulated/0/Download/bridge_hub-v${VER}.toolpkg"
 rm -f "$OUT"
 python3 - "$OUT" <<'PY'
 import zipfile, os, sys
