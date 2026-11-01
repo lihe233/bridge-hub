@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.bridge_hub2",
+  "version": "1.0.18",
+  "api_version": "2.0.0",
+  "main": "dist/main.js",
+  "display_name": {
+    "zh": "桥",
+    "en": "Bridge"
+  },
+  "description": {
+    "zh": "把微信、QQ、本机 API 三类通道接入 Operit 对话，统一收发与自动回复回传，并对外提供 OpenAI 兼容网关。支持多账号并行、扫码登录、正在输入状态、对话自动重建。",
+    "en": "Bridge WeChat, QQ and a local OpenAI-compatible API into Operit chats. Multi-account, QR login, typing indicator and automatic chat rebinding."
+  },
+  "enabled_by_default": true,
+  "installation_scope": "device",
+  "subpackages": [
+    {
+      "id": "bridge_core",
+      "entry": "dist/packages/bridge_core.js",
+      "enabled_by_default": true
+    },
+    {
+      "id": "wechat_claude_bridge",
+      "entry": "dist/packages/wechat_claude_bridge.js",
+      "enabled_by_default": true
+    }
+  ],
+  "resources": [],
+  "author": "lihe233",
+  "homepage": "https://github.com/lihe233"
+}
