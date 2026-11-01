@@ -33,7 +33,7 @@
 ## 安装
 
 1. 在 Operit 插件市场安装，或本地导入 `.toolpkg`
-2. 启用主包 `com.operit.bridge_hub2` 及两个子包
+2. 启用主包 `com.operit.bridge_hub` 及两个子包
 3. 打开侧边栏「桥」，进入 **通道** 页添加账号
 
 ---
