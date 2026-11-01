@@ -24,7 +24,7 @@
 
 Object.defineProperty(exports, "__esModule", { value: true });
 
-var CHANNEL = "bridge_hub2.service";
+var CHANNEL = "bridge_hub.service";
 function call(name, params) { return ToolPkg.ipc.call(CHANNEL, { action: "tool", tool: name, params: params || {} }, { targetRuntime: "main" }); }
 
 function mk(n) { return function (params) { return call(n, params); }; }
