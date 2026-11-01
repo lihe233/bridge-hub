@@ -6,7 +6,7 @@ var DEFAULT_CFG = { accounts: [ { name: "wx-1", channel: "wechat", enabled: true
 
 var state = { running: false, gen: 0, seen: [], logLines: [], accounts: [], received: 0, replied: 0, seeds: {}, cfgOverride: null, retry: [], wxExpired: {}, msgs: {} };
 var chatQueues = {};
-var CHANNEL = "bridge_hub2.service";
+var CHANNEL = "bridge_hub.service";
 var __ipcReady = false;
 function ensureIpc() {
     if (__ipcReady) return true;
@@ -631,7 +631,7 @@ async function __termExec(cmd) {
     try {
         if (!state.sid) {
             state.termGen = (state.termGen || 0) + 1;
-            var nm = "bridge_hub2" + (state.termGen > 1 ? "_g" + state.termGen : "");
+            var nm = "bridge_hub" + (state.termGen > 1 ? "_g" + state.termGen : "");
             var c = await T.create(nm);
             state.sid = (c && (c.sessionId || c.id)) || null;
             if (!state.sid) throw new Error("CREATE_NO_SESSION");
@@ -1374,8 +1374,8 @@ function registerToolPkg() {
         var screen = __pickScreen();
         if (screen) {
             ToolPkg.registerToolboxUiModule({ id: "bridge_settings", runtime: "compose_dsl", screen: screen, params: {}, title: { zh: "桥接设置", en: "Bridge Settings" } });
-            try { ToolPkg.registerUiRoute({ id: "bridge_settings_route", route: "toolpkg:com.operit.bridge_hub2:ui:bridge_settings_sidebar", runtime: "compose_dsl", screen: screen, params: {}, title: { zh: "桥接设置", en: "Bridge Settings" } }); } catch (eR) {}
-            try { ToolPkg.registerNavigationEntry({ id: "bridge_settings_sidebar", route: "toolpkg:com.operit.bridge_hub2:ui:bridge_settings_sidebar", surface: "main_sidebar_plugins", title: { zh: "桥", en: "Bridge" }, icon: "hub", order: 11 }); } catch (eN) {}
+            try { ToolPkg.registerUiRoute({ id: "bridge_settings_route", route: "toolpkg:com.operit.bridge_hub:ui:bridge_settings_sidebar", runtime: "compose_dsl", screen: screen, params: {}, title: { zh: "桥接设置", en: "Bridge Settings" } }); } catch (eR) {}
+            try { ToolPkg.registerNavigationEntry({ id: "bridge_settings_sidebar", route: "toolpkg:com.operit.bridge_hub:ui:bridge_settings_sidebar", surface: "main_sidebar_plugins", title: { zh: "桥", en: "Bridge" }, icon: "hub", order: 11 }); } catch (eN) {}
             try { console.log("[bridge] ui registered"); } catch (e3) {}
         } else {
             try { console.log("[bridge] ui module NOT loaded"); } catch (e4) {}
