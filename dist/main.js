@@ -89,19 +89,66 @@ function extract(out, acc) {
 }
 
 async function ask(chatId, text) {
-    var _to = Number((state.cfg && state.cfg.aiTimeoutMs) || 120000);
+    var hard = Number((state.cfg && state.cfg.aiTimeoutMs) || 600000);
     var req = { kind: "submit", chatId: chatId, runtime: "main",
         input: { text: text, attachments: [], replyToMessageTimestamp: null },
         turn: { kind: "execute" }, notifyReply: false };
-    var timer = null;
-    var guard = new Promise(function (resolve) { timer = setTimeout(function () { resolve(null); }, _to); });
-    try {
-        var result = await Promise.race([Tools.Chat.sendMessage(req), guard]);
-        if (result === null) return "";
-        return __pickText(result);
-    } finally {
-        if (timer) clearTimeout(timer);
+    var t0 = Date.now();
+    var done = false;
+    var result = null;
+    Tools.Chat.sendMessage(req).then(function (r) { done = true; result = r; })
+        .catch(function (e) { done = true; result = { __err: errText(e) }; });
+    var idleN = 0;
+    while (!done) {
+        await sleep(3000);
+        if (done) break;
+        var el = Date.now() - t0;
+        var busy = true;
+        try {
+            var st = await Tools.Chat.agentStatus(chatId);
+            busy = !!(st && (st.executing || st.running || st.isExecuting));
+        } catch (e) { busy = true; }
+        if (busy) { idleN = 0; }
+        else {
+            idleN++;
+            if (idleN >= 3) { await rlog("ASK_IDLE " + chatId + " ms=" + el); break; }
+        }
+        if (el > hard) { await rlog("ASK_HARD_TIMEOUT " + chatId + " ms=" + el); break; }
     }
+    if (!done) {
+        try { await Tools.Chat.cancel(chatId); } catch (e) { }
+        var waitN = 0;
+        while (!done && waitN < 10) { await sleep(1000); waitN++; }
+    }
+    if (result && result.__err) throw new Error(result.__err);
+    if (result === null || result === undefined) return "";
+    return __pickText(result);
+}
+
+function __splitLong(t, limit) {
+    if (!t) return [];
+    if (t.length <= limit) return [t];
+    var half = Math.ceil(t.length / 2);
+    var cut = -1;
+    var seps = ["\n\n", "\n", "。", "！", "？", "，", ".", "!", "?", ";"];
+    for (var si = 0; si < seps.length; si++) {
+        var sp = seps[si];
+        var best = -1;
+        var idx = t.indexOf(sp);
+        while (idx >= 0) {
+            var pos = idx + sp.length;
+            if (Math.abs(pos - half) < Math.abs(best - half) || best < 0) best = pos;
+            if (pos > half + 200) break;
+            idx = t.indexOf(sp, idx + 1);
+        }
+        if (best > 0 && best > limit * 0.3) { cut = best; break; }
+    }
+    if (cut <= 0) cut = Math.min(half, limit);
+    var a = t.slice(0, cut).replace(/\s+$/, "");
+    var b = t.slice(cut).replace(/^\s+/, "");
+    if (!b) return [a];
+    if (b.length > limit) b = b.slice(0, limit);
+    return [a, b];
 }
 
 function __cleanText(t) {
@@ -187,7 +234,7 @@ async function process(name, channel, from, id, text, chatId) {
     if (chatId) {
         var _stillBusy = false;
         try {
-            for (var _bw = 0; _bw < 12; _bw++) {
+            for (var _bw = 0; _bw < 120; _bw++) {
                 var stb = await Tools.Chat.agentStatus(chatId);
                 var _b = !!(stb && (stb.executing || stb.running || stb.isExecuting));
                 _stillBusy = _b;
@@ -263,6 +310,8 @@ var __typingLive = {};
 var __typingStart = {};
 var TYPING_CACHE_PATH = HUB + "typing_cache.json";
 var TYPING_MS = 1500;
+var WX_TEXT_LIMIT = 1500;
+var QQ_TEXT_LIMIT = 1500;
 var TYPING_MIN_MS = 3000;
 async function __typingTicket(a, userId, ctxToken) {
     var key = a.name + "|" + userId;
@@ -322,11 +371,16 @@ async function wxReply(a, to, ctx, text) {
         await rlog("HTTP_REPLY " + a.name + " " + JSON.stringify(r0 || {}).slice(0, 100));
         return;
     }
-    var msg = { to_user_id: to, client_id: "rt-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
-        message_type: 2, message_state: 2, item_list: [{ type: 1, text_item: { text: text } }] };
-    if (ctx) msg.context_token = ctx;
-    var r = await wxPost(a, "/ilink/bot/sendmessage", { msg: msg, base_info: { channel_version: "2.0.0" } }, 30);
-    await rlog("WX_REPLY " + a.name + " " + (r && r.errcode === 0 ? "ok" : JSON.stringify(r).slice(0, 100)));
+    var parts = __splitLong(text, WX_TEXT_LIMIT);
+    if (parts.length > 1) { await rlog("WX_SPLIT " + a.name + " parts=" + parts.length + " len=" + text.length); }
+    for (var pi = 0; pi < parts.length; pi++) {
+        if (pi > 0) { await sleep(300); }
+        var msg = { to_user_id: to, client_id: "rt-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+            message_type: 2, message_state: 2, item_list: [{ type: 1, text_item: { text: parts[pi] } }] };
+        if (ctx) msg.context_token = ctx;
+        var r = await wxPost(a, "/ilink/bot/sendmessage", { msg: msg, base_info: { channel_version: "2.0.0" } }, 30);
+        await rlog("WX_REPLY " + a.name + " " + (r && r.errcode === 0 ? "ok" : JSON.stringify(r).slice(0, 100)));
+    }
 }
 
 async function wxHandle(a, gen, m) {
@@ -552,8 +606,13 @@ async function qqMessage(a, gen, type, body) {
         var path = scene === "c2c" ? ("/v2/users/" + encodeURIComponent(from) + "/messages") : ("/v2/groups/" + encodeURIComponent(groupOpenid) + "/messages");
         var _qtxt = __cleanText(acc);
         if (!_qtxt) { await rlog("REPLY_EMPTY " + a.name); return; }
-        var res = await qqHttp("POST", "https://api.sgroup.qq.com" + path, tok, { content: _qtxt, msg_type: 0, msg_id: id });
-        await rlog("QQ_REPLY " + a.name + " " + id + " " + JSON.stringify(res || {}).slice(0, 80));
+        var _qparts = __splitLong(_qtxt, QQ_TEXT_LIMIT);
+        if (_qparts.length > 1) { await rlog("QQ_SPLIT " + a.name + " parts=" + _qparts.length + " len=" + _qtxt.length); }
+        for (var qi = 0; qi < _qparts.length; qi++) {
+            if (qi > 0) { await sleep(300); }
+            var res = await qqHttp("POST", "https://api.sgroup.qq.com" + path, tok, { content: _qparts[qi], msg_type: 0, msg_id: id });
+            await rlog("QQ_REPLY " + a.name + " " + id + " " + JSON.stringify(res || {}).slice(0, 80));
+        }
     } catch (e) { await rlog("QQ_REPLY_ERR " + a.name + " " + errText(e)); }
 }
 
@@ -791,7 +850,7 @@ async function statusSnapshot() {
 }
 
 var QR_SRC = "import sys, json, base64, io\nimport segno\n\n# 目标像素尺寸：与 UI 里 WebView 的可用宽度匹配，避免被裁切\nTARGET_PX = 600\n\nargfile = sys.argv[1]\ntext = io.open(argfile, encoding='utf-8').read().strip()\nif not text:\n    print(json.dumps({\"success\": False, \"error\": \"empty\"}))\n    sys.exit(0)\n\nqr = segno.make(text, error='m')\n\ndef png_with_target(qr, target=TARGET_PX, border=2):\n    # segno 的 scale 是每个模块的像素数；先按 scale=1 估算模块数，再反推 scale\n    n = qr.symbol_size(scale=1, border=border)[0]\n    if not n or n <= 0:\n        n = 40\n    scale = max(2, int(target / float(n)))\n    buf = io.BytesIO()\n    qr.save(buf, kind='png', scale=scale, border=border)\n    return buf.getvalue(), n, scale\n\n# 优先 PNG\ntry:\n    png, n, scale = png_with_target(qr)\n    b64 = base64.b64encode(png).decode('ascii')\n    print(json.dumps({\n        \"success\": True,\n        \"data_uri\": \"data:image/png;base64,\" + b64,\n        \"fmt\": \"png\",\n        \"modules\": n,\n        \"scale\": scale,\n        \"px\": n * scale\n    }))\n    sys.exit(0)\nexcept Exception as e:\n    png_err = str(e)\n\n# 回退 SVG\ntry:\n    buf2 = io.BytesIO()\n    qr.save(buf2, kind='svg', scale=6, border=2)\n    svg = buf2.getvalue().decode('utf-8')\n    b64 = base64.b64encode(svg.encode('utf-8')).decode('ascii')\n    print(json.dumps({\"success\": True, \"data_uri\": \"data:image/svg+xml;base64,\" + b64, \"fmt\": \"svg\", \"png_error\": png_err}))\n    sys.exit(0)\nexcept Exception as e2:\n    print(json.dumps({\"success\": False, \"error\": \"png:\" + png_err + \" svg:\" + str(e2)}))";
-var VER = "1.1.18";
+var VER = "1.3.18";
 
 async function readJsonSafe(p, def) { try { var t = await readFile(p); if (!t) return def; return JSON.parse(t); } catch (e) { return def; } }
 async function writeJson(p, obj) { return await writeFile(p, JSON.stringify(obj, null, 2)); }
