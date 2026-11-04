@@ -188,6 +188,8 @@ var ATTACH_SANDBOX_PY = "/data/data/app.operit/files/runtime/identities/identity
 // 把本地文件变成平台可识别的多模态附件标签。
 // 平台解析消息文本里的 attachment 标签：闭合内容为 multimodal 提示时才真正注入像素；
 // 写成路径则只当文件引用（模型只能 read_file 拿到 OCR 结果）。
+// 按照官方插件的做法把文件放进插件配置目录的 incoming 下，
+// 再用 Tools.Files.copy 复制，最后以 getConfigDir() 路径引用。
 async function __mkAttach(path, name, mime, chatId) {
     try {
         if (!path) return "";
@@ -204,25 +206,17 @@ async function __mkAttach(path, name, mime, chatId) {
             return "";
         }
         var usePath = vp;
-        if (chatId) {
-            var _h = 0;
-            var _mk = String(path);
-            for (var _i2 = 0; _i2 < _mk.length; _i2++) { _h = ((_h * 31) + _mk.charCodeAt(_i2)) & 0x7fffffff; }
-            var _dir = ATTACH_CHAT_DIR + chatId + "/" + _h.toString(16) + "/";
-            var _now = Date.now();
-            var _safe = fn.replace(/[^A-Za-z0-9._-]/g, "_");
-            var _dst = _dir + _now + "_" + _safe;
-            try {
-                await writeFile(MEDIA_DIR + "cp_" + _now + ".json", JSON.stringify({ src: String(path).replace("/mnt/android/sdcard", "/storage/emulated/0"), dst: _dst, rdst: _dst.replace("/app/data/data/chat_attachments/", ATTACH_REAL_DIR) }));
-                var _ok = false;
-                for (var _w2 = 0; _w2 < 100; _w2++) {
-                    await sleep(100);
-                    try { var _r2 = await Tools.Files.info(_dst); if (_r2 && Number(_r2.size) >= sz) { _ok = true; break; } } catch (eW2) { }
-                }
-                if (_ok) { usePath = _dst; await rlog("ATTACH_CP_OK " + fn); }
-                else await rlog("ATTACH_CP_FAIL " + fn);
-            } catch (eC) { await rlog("ATTACH_CP_ERR " + errText(eC)); }
-        }
+        try {
+            var _root = ToolPkg.getConfigDir();
+            var _dir = _root + "/incoming/" + String(chatId || "x") + "/" + String(Date.now());
+            var _mkd = await Tools.Files.mkdir(_dir, true);
+            var _dst = _dir + "/" + fn.replace(/[^A-Za-z0-9._-]/g, "_");
+            await Tools.Files.copy(vp, _dst);
+            var _chk = null;
+            try { _chk = await Tools.Files.info(_dst); } catch (e0) { }
+            if (_chk && Number(_chk.size) >= sz) { usePath = _dst; await rlog("ATTACH_CP_OK " + fn); }
+            else await rlog("ATTACH_CP_FAIL " + fn + " got=" + String(_chk && _chk.size));
+        } catch (eC) { await rlog("ATTACH_CP_ERR " + errText(eC)); }
         var q = String.fromCharCode(34);
         var tag = "<attachment id=" + q + usePath + q + " filename=" + q + fn + q + " type=" + q + mt + q + " size=" + q + sz + q + ">";
         tag = tag + ATTACH_HINT + "</attachment>";
@@ -536,7 +530,35 @@ async function __wxMedia(a, m, msgId) {
             var media = node.media || {};
             var url = media.full_url || "";
             if (!url) continue;
-            var key = String(node.aeskey || node.aes_key || "").trim();
+            // 微信的 aes_key 在 media 层，且是 base64（解出来是 32 位 hex 字符串）。
+            // 下载脚本只认长度为 32 的 hex 字符串，所以这里先解码成 hex 再传。
+            // 之前写成 node.aeskey / node.aes_key 取不到值，导致密文被原样存盘、
+            // 头部认不出格式、文件名没有扩展名，最终被当成图片处理。
+            var key = "";
+            var rawKey = String(media.aes_key || media.aeskey || node.aeskey || node.aes_key || "").trim();
+            if (rawKey) {
+                if (/^[0-9a-fA-F]{32}$/.test(rawKey)) {
+                    key = rawKey.toLowerCase();
+                } else {
+                    try {
+                        var dec = "";
+                        var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                        var s = rawKey.replace(/[^A-Za-z0-9+/]/g, "");
+                        var buf = 0, bits = 0;
+                        for (var bi = 0; bi < s.length; bi++) {
+                            buf = (buf << 6) | B64.indexOf(s.charAt(bi));
+                            bits += 6;
+                            if (bits >= 8) {
+                                bits -= 8;
+                                var by = (buf >> bits) & 0xff;
+                                if (by >= 0x20 && by < 0x7f) dec += String.fromCharCode(by);
+                            }
+                        }
+                        if (/^[0-9a-fA-F]{32}$/.test(dec)) key = dec.toLowerCase();
+                    } catch (eK) { }
+                }
+            }
+            if (!key) await rlog("WX_NO_AESKEY " + a.name + " " + String(fname || kind));
             jobs.push({ url: url, key: key, kind: kind, name: fname });
         }
         if (!jobs.length) return "";
@@ -546,6 +568,14 @@ async function __wxMedia(a, m, msgId) {
             var job = jobs[k];
             var jobTag = tag + "_" + k;
             var outPath = MEDIA_PY + job.kind + "_wx_" + jobTag;
+            // 微信的 file_item 带原始文件名，直接把扩展名带上，避免下载后无从判断格式
+            if (job.kind === "file" && job.name) {
+                var _dot = String(job.name).lastIndexOf(".");
+                if (_dot > 0) {
+                    var _extn = String(job.name).slice(_dot).replace(/[^A-Za-z0-9.]/g, "");
+                    if (_extn && _extn.length <= 10) outPath += _extn;
+                }
+            }
             var payload = { url: job.url, key: job.key, out: outPath, kind: job.kind, name: job.name };
             try { await Tools.Files.mkdir(MEDIA_DIR); } catch (e0) { }
             await writeFile(MEDIA_DIR + "job_" + jobTag + ".json", JSON.stringify(payload));
@@ -823,16 +853,28 @@ async function qqFrame(a, gen, f) {
 async function __qqMedia(a, atts, msgId) {
     try {
         var jobs = [];
+        var skipped = [];
         for (var i = 0; i < atts.length; i++) {
             var at = atts[i] || {};
             var u = at.url || "";
-            if (!u) continue;
             var ct = String(at.content_type || "");
+            var _fn = String(at.filename || "");
+            if (!u && ct === "file") {
+                // QQ 官方 Bot API 对 file 类型附件只下发 content_type/filename/size，url 恒为空串。
+                // 官方没有任何「获取用户发来文件」的接口：
+                //   /v2/users/{openid}/files 是发送方向（机器人上传文件给对方），
+                //   其响应 raw_url 仅在上传合并 + file_type 为图片/视频/语音时返回，
+                //   且明确「文件类型(file_type=4)不返回此字段」。
+                // 因此 QQ 通道下压缩包等普通文件无法下载，记录文件名与大小用于提示用户。
+                skipped.push({ name: _fn || "(未知文件)", size: Number(at.size || 0) });
+                await rlog("QQ_FILE_UNSUPPORTED " + a.name + " " + _fn + " size=" + String(at.size || "?"));
+                continue;
+            }
+            if (!u) continue;
             var kind = "file";
             if (ct.indexOf("image/") === 0) kind = "img";
             else if (ct.indexOf("video/") === 0) kind = "video";
             else if (ct.indexOf("audio/") === 0) kind = "voice";
-            var _fn = String(at.filename || "");
             if (_fn && _fn.indexOf(".") < 0) {
                 // QQ 的 filename 往往只是一个哈希串，没有扩展名；按类型补一个，
                 // 否则 mimeType/文件名会判断错。
@@ -841,7 +883,7 @@ async function __qqMedia(a, atts, msgId) {
             }
             jobs.push({ url: u, kind: kind, ct: ct, name: _fn });
         }
-        if (!jobs.length) return "";
+        if (!jobs.length) return { outs: [], skipped: skipped };
         var tag = String(msgId).replace(/[^a-zA-Z0-9]/g, "").slice(-20) + "_" + Date.now();
         var outs = [];
         for (var k = 0; k < jobs.length; k++) {
@@ -867,12 +909,11 @@ async function __qqMedia(a, atts, msgId) {
             }
             if (got) outs.push({ kind: job.kind, path: got, name: job.name });
         }
-        if (!outs.length) return "";
-        await rlog("QQ_MEDIA " + a.name + " n=" + outs.length);
-        return outs;
+        if (outs.length) await rlog("QQ_MEDIA " + a.name + " n=" + outs.length);
+        return { outs: outs, skipped: skipped };
     } catch (e) {
         await rlog("QQ_MEDIA_ERR " + errText(e));
-        return "";
+        return { outs: [], skipped: [] };
     }
 }
 async function qqMessage(a, gen, type, body) {
@@ -891,7 +932,10 @@ async function qqMessage(a, gen, type, body) {
     }
     if (!id || (!text && !_atts.length)) return;
     if (_atts.length) {
-        var _qmds = await __qqMedia(a, _atts, id);
+        var _qres = await __qqMedia(a, _atts, id);
+        var _qmds = (_qres && _qres.outs) ? _qres.outs : [];
+        var _qskip = (_qres && _qres.skipped) ? _qres.skipped : [];
+        var _qnotes = [];
         if (_qmds && _qmds.length) {
             var _qlines = [];
             for (var _qi = 0; _qi < _qmds.length; _qi++) {
@@ -899,9 +943,17 @@ async function qqMessage(a, gen, type, body) {
                 var _ql = (_qk === "img") ? "[图片] " : ((_qk === "voice") ? "[语音] " : ((_qk === "video") ? "[视频] " : "[文件] "));
                 _qlines.push(_ql + _qmds[_qi].path);
             }
-            var _qblk = _qlines.join(String.fromCharCode(10));
-            text = text ? (text + String.fromCharCode(10) + _qblk) : _qblk;
-        } else {
+            _qnotes.push(_qlines.join(String.fromCharCode(10)));
+        }
+        for (var _qs = 0; _qs < _qskip.length; _qs++) {
+            var _sk = _qskip[_qs];
+            var _kb = Math.round((_sk.size || 0) / 1024);
+            var _sz = _kb >= 1024 ? (Math.round(_kb / 1024 * 10) / 10) + "MB" : (_kb + "KB");
+            _qnotes.push("[文件] " + _sk.name + "（" + _sz + "）—— QQ 通道不支持接收文件，未能下载，请改用微信发送或直接发图片");
+        }
+        if (_qnotes.length) {
+            text = text ? (text + String.fromCharCode(10) + _qnotes.join(String.fromCharCode(10))) : _qnotes.join(String.fromCharCode(10));
+        } else if (_qskip.length) {
             text = text ? (text + String.fromCharCode(10) + "[附件下载失败]") : "[附件下载失败]";
         }
     }
@@ -965,7 +1017,7 @@ async function startHttp(acc, gen) {
 
 var GW_SRC = "#!/usr/bin/env python3\nimport json, sys, os, re, queue, uuid, argparse, threading, time\nfrom http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n\nHUB = \"/storage/emulated/0/Download/Operit/bridge_hub\"\nMEDIA_DIR = HUB + \"/media\"\nRTLOG = HUB + \"/rt.log\"\n\ndef trim_log():\n    try:\n        if os.path.getsize(RTLOG) > 524288:\n            with open(RTLOG, \"r\", encoding=\"utf-8\", errors=\"ignore\") as f:\n                tail = f.readlines()[-300:]\n            with open(RTLOG, \"w\", encoding=\"utf-8\") as f:\n                f.writelines(tail)\n    except Exception:\n        pass\n\ndef wlog(msg):\n    try:\n        trim_log()\n        with open(RTLOG, \"a\", encoding=\"utf-8\") as f:\n            f.write(time.strftime(\"%H:%M:%S \", time.localtime()) + msg + \"\\n\")\n    except Exception:\n        pass\n\nclass PortState(object):\n    def __init__(self, port, key, allow_public):\n        self.port = port\n        self.key = key or \"\"\n        self.allow_public = bool(allow_public)\n        self.q = queue.Queue()\n        self.pend = {}\n        self.lock = threading.Lock()\n\n\ndef _img_ext(ct):\n    s = str(ct or \"\").lower()\n    if \"png\" in s: return \".png\"\n    if \"gif\" in s: return \".gif\"\n    if \"webp\" in s: return \".webp\"\n    return \".jpg\"\n\n\ndef save_image(src, tag):\n    \"\"\"\u4ece url / data uri \u62ff\u56fe\u5e76\u5b58\u5230 MEDIA_DIR\uff0c\u8fd4\u56de\u672c\u5730\u8def\u5f84\u6216\u7a7a\u4e32\u3002\"\"\"\n    try:\n        os.makedirs(MEDIA_DIR, exist_ok=True)\n    except Exception:\n        pass\n    s = str(src or \"\").strip()\n    if not s:\n        return \"\"\n    try:\n        if s.startswith(\"data:\"):\n            head, _, b64 = s.partition(\",\")\n            import base64\n            raw = base64.b64decode(b64)\n            ext = _img_ext(head)\n        elif s.startswith(\"http://\") or s.startswith(\"https://\"):\n            import urllib.request\n            rq = urllib.request.Request(s, headers={\"User-Agent\": \"Mozilla/5.0\"})\n            with urllib.request.urlopen(rq, timeout=40) as r:\n                raw = r.read()\n                ext = _img_ext(r.headers.get(\"Content-Type\"))\n        elif os.path.isabs(s) and os.path.isfile(s):\n            return s\n        else:\n            return \"\"\n        if not raw:\n            return \"\"\n        out = os.path.join(MEDIA_DIR, \"gw_\" + tag + ext)\n        with open(out, \"wb\") as f:\n            f.write(raw)\n        wlog(\"GW IMG %s %d\" % (out, len(raw)))\n        return out\n    except Exception as e:\n        wlog(\"GW IMG_ERR %s\" % str(e)[:100])\n        return \"\"\n\n\ndef make_handler(st):\n    class H(BaseHTTPRequestHandler):\n        def log_message(self, *a): pass\n        def _out(self, code, obj):\n            b = json.dumps(obj, ensure_ascii=False).encode(\"utf-8\")\n            self.send_response(code)\n            self.send_header(\"Content-Type\", \"application/json; charset=utf-8\")\n            self.send_header(\"Content-Length\", str(len(b)))\n            self.end_headers()\n            self.wfile.write(b)\n        def _lan(self):\n            if st.allow_public: return True\n            ip = self.client_address[0]\n            if ip.startswith((\"127.\", \"10.\", \"192.168.\", \"fe80\", \"::1\")): return True\n            return re.match(r\"^172\\.(1[6-9]|2\\d|3[01])\\.\", ip) is not None\n        def _auth(self):\n            if not st.key: return True\n            h = self.headers.get(\"Authorization\", \"\")\n            if h.startswith(\"Bearer \"): h = h[7:]\n            return h == st.key\n        def _read_chunked(self):\n            data = b\"\"\n            while True:\n                line = self.rfile.readline().strip()\n                if not line: break\n                try: n = int(line.split(b\";\")[0], 16)\n                except Exception: break\n                if n == 0:\n                    try: self.rfile.readline()\n                    except Exception: pass\n                    break\n                data += self.rfile.read(n)\n                try: self.rfile.readline()\n                except Exception: pass\n            return data\n        def _body(self):\n            try:\n                te = (self.headers.get(\"Transfer-Encoding\") or \"\").lower()\n                if \"chunked\" in te:\n                    return json.loads(self._read_chunked().decode(\"utf-8\") or \"{}\")\n                n = int(self.headers.get(\"Content-Length\", \"0\"))\n                return json.loads(self.rfile.read(n).decode(\"utf-8\") or \"{}\")\n            except Exception:\n                return {}\n        def do_GET(self):\n            if not self._lan(): return self._out(403, {\"error\": \"public access disabled\"})\n            p = self.path.split(\"?\")[0]\n            if p in (\"/health\", \"/\"):\n                return self._out(200, {\"ok\": True, \"service\": \"operit-gw\", \"port\": st.port, \"auth\": bool(st.key), \"public\": st.allow_public, \"pending\": len(st.pend), \"queued\": st.q.qsize()})\n            if p == \"/v1/models\":\n                return self._out(200, {\"object\": \"list\", \"data\": [{\"id\": \"operit-bridge\", \"object\": \"model\"}]})\n            return self._out(404, {\"error\": \"not found\"})\n        def do_POST(self):\n            ip = self.client_address[0]\n            if not self._lan():\n                wlog(\"GW 403-public \" + ip + \" \" + self.path)\n                return self._out(403, {\"error\": \"public access disabled\"})\n            p = self.path.split(\"?\")[0]\n            body = self._body()\n            if p.endswith(\"/log\"):\n                if not (ip.startswith(\"127.\") or ip in (\"::1\", \"localhost\")):\n                    wlog(\"GW 403-log \" + ip)\n                    return self._out(403, {\"error\": \"log only from localhost\"})\n                try:\n                    lines = body.get(\"lines\") or []\n                    if isinstance(lines, str): lines = [lines]\n                    with open(RTLOG, \"a\", encoding=\"utf-8\") as f:\n                        for ln in lines: f.write(str(ln) + \"\\n\")\n                except Exception:\n                    pass\n                trim_log()\n                return self._out(200, {\"errcode\": 0})\n            if not self._auth():\n                wlog(\"GW 401 \" + ip + \" \" + p)\n                return self._out(401, {\"error\": {\"message\": \"invalid api key\", \"type\": \"auth\"}})\n            if p.endswith(\"/chat/completions\"):\n                text = \"\"\n                imgs = []\n                for m in (body.get(\"messages\") or []):\n                    c = m.get(\"content\")\n                    if isinstance(c, str):\n                        if m.get(\"role\") == \"user\": text = c\n                        continue\n                    if not isinstance(c, list):\n                        continue\n                    tt = []\n                    for x in c:\n                        if not isinstance(x, dict):\n                            continue\n                        tp = x.get(\"type\") or \"\"\n                        if tp == \"text\":\n                            tt.append(str(x.get(\"text\") or \"\"))\n                        elif tp == \"image_url\":\n                            iu = x.get(\"image_url\")\n                            if isinstance(iu, dict): iu = iu.get(\"url\")\n                            if iu: imgs.append(str(iu))\n                        elif tp == \"input_image\" and x.get(\"image_url\"):\n                            imgs.append(str(x.get(\"image_url\")))\n                        elif tp in (\"file\", \"file_url\", \"input_file\", \"attachment\"):\n                            fu = x.get(tp) or x.get(\"file_url\") or x.get(\"url\")\n                            if isinstance(fu, dict): fu = fu.get(\"url\") or fu.get(\"file_url\")\n                            if fu: imgs.append(str(fu))\n                        elif tp == \"audio\" or tp == \"input_audio\":\n                            au = x.get(\"audio\") or x.get(\"input_audio\")\n                            if isinstance(au, dict): au = au.get(\"url\") or au.get(\"data\")\n                            if isinstance(au, str) and au:\n                                if au.startswith(\"http\") or au.startswith(\"data:\"):\n                                    imgs.append(au)\n                                else:\n                                    imgs.append(\"data:audio/wav;base64,\" + au)\n                    if m.get(\"role\") == \"user\":\n                        text = \"\".join(tt)\n                if imgs:\n                    rid0 = \"gw-\" + uuid.uuid4().hex[:16]\n                    paths = []\n                    for k, u in enumerate(imgs[:4]):\n                        pth = save_image(u, rid0 + \"_\" + str(k))\n                        paths.append(pth or \"[\u56fe\u7247\u4e0b\u8f7d\u5931\u8d25]\")\n                    ext = \"\\n\".join([\"[\u56fe\u7247] \" + p for p in paths])\n                    text = (text + \"\\n\" + ext) if text else ext\n                if not text: return self._out(400, {\"error\": {\"message\": \"empty message\"}})\n                rid = \"gw-\" + uuid.uuid4().hex[:16]\n                src = body.get(\"user\") or (\"port-%d\" % st.port)\n                q = queue.Queue()\n                with st.lock: st.pend[rid] = q\n                st.q.put({\"id\": rid, \"from\": src, \"text\": text})\n                wlog(\"GW QUEUE %s from=%s len=%d\" % (rid, src, len(text)))\n                t0 = time.time()\n                try:\n                    reply = q.get(timeout=int(body.get(\"timeout\", 120)))\n                except queue.Empty:\n                    with st.lock: st.pend.pop(rid, None)\n                    wlog(\"GW TIMEOUT %s %.1fs\" % (rid, time.time() - t0))\n                    return self._out(504, {\"error\": {\"message\": \"operit timeout\"}})\n                wlog(\"GW DONE %s %.1fs len=%d\" % (rid, time.time() - t0, len(reply or \"\")))\n                return self._out(200, {\"id\": \"chatcmpl-\" + rid, \"object\": \"chat.completion\", \"model\": body.get(\"model\") or \"operit-bridge\",\n                    \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": reply}, \"finish_reason\": \"stop\"}],\n                    \"usage\": {\"prompt_tokens\": 0, \"completion_tokens\": 0, \"total_tokens\": 0}})\n            if p.endswith(\"/getupdates\"):\n                msgs = []\n                while len(msgs) < 10:\n                    try: msgs.append(st.q.get_nowait())\n                    except queue.Empty: break\n                if msgs: wlog(\"GW PULL %d pending=%d\" % (len(msgs), len(st.pend)))\n                return self._out(200, {\"errcode\": 0, \"get_updates_buf\": str(st.port), \"msgs\": msgs})\n            if p.endswith(\"/sendmessage\"):\n                rid = body.get(\"reply_to\") or \"\"\n                with st.lock: q = st.pend.pop(rid, None)\n                if q: q.put(body.get(\"text\") or \"\")\n                wlog(\"GW PUSH %s delivered=%s len=%d\" % (rid, bool(q), len(body.get(\"text\") or \"\")))\n                return self._out(200, {\"errcode\": 0, \"delivered\": bool(q)})\n            return self._out(404, {\"errcode\": 404})\n    return H\n\ndef serve(cfg):\n    st = PortState(cfg[\"port\"], cfg.get(\"key\", \"\"), cfg.get(\"allow_public\", False))\n    srv = ThreadingHTTPServer((\"0.0.0.0\", st.port), make_handler(st))\n    print(\"gw listening %d key=%s public=%s\" % (st.port, bool(st.key), st.allow_public), flush=True)\n    wlog(\"GW LISTEN port=%d auth=%s public=%s\" % (st.port, bool(st.key), st.allow_public))\n    srv.serve_forever()\n\nif __name__ == \"__main__\":\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--config\", default=\"\")\n    ap.add_argument(\"--port\", type=int, default=0)\n    ap.add_argument(\"--key\", default=\"\")\n    ap.add_argument(\"--allow-public\", action=\"store_true\")\n    a = ap.parse_args()\n    if a.config and os.path.exists(a.config):\n        cfgs = json.load(open(a.config, encoding=\"utf-8\"))\n    else:\n        cfgs = [{\"port\": a.port or 8789, \"key\": a.key, \"allow_public\": a.allow_public}]\n    print(\"gw started %d ports\" % len(cfgs), flush=True)\n    wlog(\"GW BOOT ports=%d\" % len(cfgs))\n    for c in cfgs:\n        t = threading.Thread(target=serve, args=(c,), daemon=True)\n        t.start()\n    threading.Event().wait()\n";
 var GW_PATH = "/mnt/android/sdcard/Download/Operit/bridge_hub/gw.py";
-var WXPOLL_SRC = "# -*- coding: utf-8 -*-\nimport json, time, os, threading\nimport urllib.request\n\nHUB = \"/storage/emulated/0/Download/Operit/bridge_hub\"\nINBOX = HUB + \"/wx_inbox.jsonl\"\nTYPING_DIR = HUB + \"/typing\"\nMEDIA_DIR = HUB + \"/media\"\nBUF_LOCK = threading.Lock()\nSEEN = set()\nSEEN_LOCK = threading.Lock()\nLANES = 3\nGAP = 6\nTK_MS = 1500\nTICKET = {}\nTK_LOCK = threading.Lock()\n\n\ndef wlog(m):\n    try:\n        with open(HUB + \"/wxpoll.log\", \"a\", encoding=\"utf-8\") as f:\n            f.write(time.strftime(\"%H:%M:%S \", time.localtime()) + str(m) + chr(10))\n    except Exception:\n        pass\n\n\ndef post(url, body, headers, timeout=40):\n    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method=\"POST\")\n    with urllib.request.urlopen(req, timeout=timeout) as r:\n        return json.loads(r.read().decode(\"utf-8\"))\n\n\ndef mid_of(m):\n    v = m.get(\"msg_id\")\n    if v:\n        return str(v)\n    try:\n        it = (m.get(\"item_list\") or [])[0]\n        if isinstance(it, dict) and it.get(\"msg_id\"):\n            return str(it[\"msg_id\"])\n    except Exception:\n        pass\n    return str(m.get(\"message_id\") or \"\")\n\n\ndef mx_headers(token):\n    return {\"Content-Type\": \"application/json\", \"Authorization\": \"Bearer \" + token,\n            \"AuthorizationType\": \"ilink_bot_token\", \"User-Agent\": \"operit-bridge-wxpoll\"}\n\n\ndef guess_ext(raw):\n    if not raw:\n        return \"\"\n    h = raw[:16]\n    if h[:3] == b\"\\xff\\xd8\\xff\":\n        return \".jpg\"\n    if h[:8] == b\"\\x89PNG\\r\\n\\x1a\\n\":\n        return \".png\"\n    if h[:6] in (b\"GIF87a\", b\"GIF89a\"):\n        return \".gif\"\n    if h[:4] == b\"RIFF\" and raw[8:12] == b\"WEBP\":\n        return \".webp\"\n    if h[:4] == b\"RIFF\" and raw[8:12] == b\"WAVE\":\n        return \".wav\"\n    if h[4:8] == b\"ftyp\":\n        return \".mp4\"\n    if h[:4] == b\"OggS\":\n        return \".ogg\"\n    if h[:3] == b\"ID3\":\n        return \".mp3\"\n    if h[:4] == b\"%PDF\":\n        return \".pdf\"\n    if h[:4] == b\"PK\\x03\\x04\":\n        return \".zip\"\n    if h[:2] == b\"BM\":\n        return \".bmp\"\n    if h[:2] == b\"AM\":\n        return \".amr\"\n    if h[:2] == b\"#!\":\n        return \".silk\"\n    return \"\"\n\n\ndef media_daemon():\n    try:\n        os.makedirs(MEDIA_DIR, exist_ok=True)\n    except Exception:\n        pass\n    while True:\n        try:\n            names = os.listdir(MEDIA_DIR) if os.path.isdir(MEDIA_DIR) else []\n        except Exception:\n            names = []\n        for fn in names:\n            if fn.startswith(\"cp_\") and fn.endswith(\".json\"):\n                _cpjd = None\n                try:\n                    _cpjd = json.load(open(os.path.join(MEDIA_DIR, fn), encoding=\"utf-8\"))\n                except Exception:\n                    _cpjd = None\n                if _cpjd:\n                    try:\n                        _real_dst = _cpjd[\"rdst\"]\n                        os.makedirs(os.path.dirname(_real_dst), exist_ok=True)\n                        import shutil\n                        shutil.copyfile(_cpjd[\"src\"], _real_dst)\n                        wlog(\"CP_OK \" + _real_dst)\n                    except Exception as _ce:\n                        wlog(\"CP_ERR \" + str(_ce)[:100])\n                try:\n                    os.remove(os.path.join(MEDIA_DIR, fn))\n                except Exception:\n                    pass\n                continue\n            if not fn.startswith(\"job_\") or not fn.endswith(\".json\"):\n                continue\n            jp = os.path.join(MEDIA_DIR, fn)\n            tag = fn[4:-5]\n            try:\n                job = json.load(open(jp, encoding=\"utf-8\"))\n            except Exception:\n                try:\n                    os.remove(jp)\n                except Exception:\n                    pass\n                continue\n            try:\n                req = urllib.request.Request(job[\"url\"])\n                req.add_header(\"User-Agent\", \"Mozilla/5.0\")\n                with urllib.request.urlopen(req, timeout=120) as r:\n                    cl = r.headers.get(\"Content-Length\")\n                    if cl and int(cl) > 67108864:\n                        raise Exception(\"file too large: \" + str(cl))\n                    chunks = []\n                    got = 0\n                    while True:\n                        part = r.read(262144)\n                        if not part:\n                            break\n                        got += len(part)\n                        if got > 67108864:\n                            raise Exception(\"file too large: \" + str(got))\n                        chunks.append(part)\n                    raw = b\"\".join(chunks)\n                kh = (job.get(\"key\") or \"\").strip()\n                if kh and len(kh) == 32:\n                    from Crypto.Cipher import AES\n                    from Crypto.Util.Padding import unpad\n                    raw = unpad(AES.new(bytes.fromhex(kh), AES.MODE_ECB).decrypt(raw), 16)\n                out_path = job[\"out\"]\n                if not os.path.splitext(out_path)[1]:\n                    out_path = out_path + guess_ext(raw)\n                with open(out_path, \"wb\") as f:\n                    f.write(raw)\n                with open(os.path.join(MEDIA_DIR, \"done_\" + tag + \".json\"), \"w\", encoding=\"utf-8\") as f:\n                    json.dump({\"ok\": True, \"path\": out_path}, f)\n                wlog(\"MEDIA_OK \" + out_path + \" \" + str(len(raw)))\n            except Exception as e:\n                try:\n                    with open(os.path.join(MEDIA_DIR, \"done_\" + tag + \".json\"), \"w\", encoding=\"utf-8\") as f:\n                        json.dump({\"ok\": False, \"err\": str(e)[:120]}, f)\n                except Exception:\n                    pass\n                wlog(\"MEDIA_ERR \" + str(e)[:120])\n            try:\n                os.remove(jp)\n            except Exception:\n                pass\n        time.sleep(0.3)\n\n\ndef get_ticket(name, token, base):\n    with TK_LOCK:\n        if name in TICKET:\n            return TICKET[name]\n    try:\n        d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n        uid = d.get(\"wechatUserId\") or \"\"\n        j = post(base + \"/ilink/bot/getconfig\",\n                 {\"ilink_user_id\": uid, \"context_token\": \"\", \"base_info\": {\"channel_version\": \"2.0.0\"}},\n                 mx_headers(token), 15)\n        tk = j.get(\"typing_ticket\") or \"\"\n        if tk:\n            with TK_LOCK:\n                TICKET[name] = tk\n        return tk\n    except Exception as e:\n        wlog(\"TK_ERR \" + name + \" \" + str(e)[:100])\n        return \"\"\n\n\ndef send_typing(name, token, base, status):\n    tk = get_ticket(name, token, base)\n    if not tk:\n        return False\n    try:\n        d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n        uid = d.get(\"wechatUserId\") or \"\"\n        post(base + \"/ilink/bot/sendtyping\",\n             {\"ilink_user_id\": uid, \"typing_ticket\": tk, \"status\": status,\n              \"base_info\": {\"channel_version\": \"2.0.0\"}}, mx_headers(token), 10)\n        return True\n    except Exception as e:\n        wlog(\"TP_ERR \" + name + \" s=\" + str(status) + \" \" + str(e)[:80])\n        return False\n\n\ndef typing_daemon():\n    active = {}\n    while True:\n        try:\n            names = os.listdir(TYPING_DIR) if os.path.isdir(TYPING_DIR) else []\n        except Exception:\n            names = []\n        now = time.time()\n        for fn in names:\n            if not fn.endswith(\".json\"):\n                continue\n            name = fn[:-5]\n            try:\n                age = now - os.path.getmtime(os.path.join(TYPING_DIR, fn))\n            except Exception:\n                age = 999\n            if age > 30:\n                try:\n                    os.remove(os.path.join(TYPING_DIR, fn))\n                except Exception:\n                    pass\n                if name in active:\n                    info = active.pop(name)\n                    send_typing(info[0], info[1], info[2], 2)\n                continue\n            if name in active:\n                info = active[name]\n                if now - info[3] >= TK_MS / 1000.0:\n                    send_typing(info[0], info[1], info[2], 1)\n                    active[name] = (info[0], info[1], info[2], now, info[4] + 1)\n            else:\n                try:\n                    d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n                    tok = d.get(\"wechatToken\") or d.get(\"token\") or \"\"\n                    base = (d.get(\"baseUrl\") or \"https://ilinkai.weixin.qq.com\").rstrip(\"/\")\n                except Exception:\n                    continue\n                if not tok:\n                    continue\n                send_typing(name, tok, base, 1)\n                active[name] = (name, tok, base, now, 1)\n        for name in list(active.keys()):\n            if name not in [x[:-5] for x in names if x.endswith(\".json\")]:\n                info = active.pop(name)\n                send_typing(info[0], info[1], info[2], 2)\n        time.sleep(0.4)\n\n\ndef poll(acc, lane):\n    name = acc.get(\"name\") or \"\"\n    token = acc.get(\"token\") or \"\"\n    base = (acc.get(\"baseUrl\") or \"https://ilinkai.weixin.qq.com\").rstrip(\"/\")\n    if not name or not token:\n        return\n    if lane > 0:\n        time.sleep(lane * GAP)\n    path = HUB + \"/accounts/\" + name + \"/sync_buf.txt\"\n    try:\n        buf = open(path, encoding=\"utf-8\").read().strip()\n    except Exception:\n        buf = \"\"\n    h = mx_headers(token)\n    wlog(\"LANE \" + name + \" #\" + str(lane) + \" START\")\n    while True:\n        try:\n            j = post(base + \"/ilink/bot/getupdates\", {\"get_updates_buf\": buf,\n                     \"base_info\": {\"channel_version\": \"2.0.0\"}}, h, 40)\n            nb = j.get(\"get_updates_buf\") or \"\"\n            if nb and nb != buf:\n                buf = nb\n                with BUF_LOCK:\n                    try:\n                        open(path, \"w\", encoding=\"utf-8\").write(nb)\n                    except Exception:\n                        pass\n            msgs = j.get(\"msgs\") or j.get(\"message_list\") or []\n            if msgs:\n                try:\n                    with open(INBOX, \"a\", encoding=\"utf-8\") as f:\n                        for m in msgs:\n                            _mid = mid_of(m)\n                            _dup = False\n                            if _mid:\n                                with SEEN_LOCK:\n                                    if _mid in SEEN:\n                                        _dup = True\n                                    else:\n                                        SEEN.add(_mid)\n                                        if len(SEEN) > 2000:\n                                            SEEN.clear()\n                            if _dup:\n                                continue\n                            f.write(json.dumps({\"acc\": name, \"m\": m}, ensure_ascii=False) + chr(10))\n                except Exception as e2:\n                    wlog(\"WRITE_ERR \" + str(e2)[:80])\n                wlog(\"GET \" + name + \" lane=\" + str(lane) + \" n=\" + str(len(msgs)))\n        except Exception as e:\n            wlog(\"ERR \" + name + \"#\" + str(lane) + \" \" + str(e)[:120])\n            time.sleep(3)\n\n\ndef main():\n    try:\n        os.makedirs(TYPING_DIR, exist_ok=True)\n        os.makedirs(MEDIA_DIR, exist_ok=True)\n    except Exception:\n        pass\n    threading.Thread(target=typing_daemon, daemon=True).start()\n    threading.Thread(target=media_daemon, daemon=True).start()\n    try:\n        cfgs = json.load(open(HUB + \"/wxpoll_cfg.json\", encoding=\"utf-8\"))\n    except Exception as e:\n        wlog(\"NO_CFG \" + str(e)[:100])\n        cfgs = []\n    for acc in cfgs:\n        for lane in range(LANES):\n            threading.Thread(target=poll, args=(acc, lane), daemon=True).start()\n    wlog(\"STARTED\")\n    while True:\n        time.sleep(60)\n\n\nif __name__ == \"__main__\":\n    main()\n";
+var WXPOLL_SRC = "# -*- coding: utf-8 -*-\nimport json, time, os, threading\nimport urllib.request\n\nHUB = \"/storage/emulated/0/Download/Operit/bridge_hub\"\nINBOX = HUB + \"/wx_inbox.jsonl\"\nTYPING_DIR = HUB + \"/typing\"\nMEDIA_DIR = HUB + \"/media\"\nBUF_LOCK = threading.Lock()\nSEEN = set()\nSEEN_LOCK = threading.Lock()\nLANES = 3\nGAP = 6\nTK_MS = 1500\nTICKET = {}\nTK_LOCK = threading.Lock()\n\n\ndef wlog(m):\n    try:\n        with open(HUB + \"/wxpoll.log\", \"a\", encoding=\"utf-8\") as f:\n            f.write(time.strftime(\"%H:%M:%S \", time.localtime()) + str(m) + chr(10))\n    except Exception:\n        pass\n\n\ndef post(url, body, headers, timeout=40):\n    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method=\"POST\")\n    with urllib.request.urlopen(req, timeout=timeout) as r:\n        return json.loads(r.read().decode(\"utf-8\"))\n\n\ndef mid_of(m):\n    v = m.get(\"msg_id\")\n    if v:\n        return str(v)\n    try:\n        it = (m.get(\"item_list\") or [])[0]\n        if isinstance(it, dict) and it.get(\"msg_id\"):\n            return str(it[\"msg_id\"])\n    except Exception:\n        pass\n    return str(m.get(\"message_id\") or \"\")\n\n\ndef mx_headers(token):\n    return {\"Content-Type\": \"application/json\", \"Authorization\": \"Bearer \" + token,\n            \"AuthorizationType\": \"ilink_bot_token\", \"User-Agent\": \"operit-bridge-wxpoll\"}\n\n\ndef guess_ext(raw):\n    if not raw:\n        return \"\"\n    h = raw[:16]\n    if h[:3] == b\"\\xff\\xd8\\xff\":\n        return \".jpg\"\n    if h[:8] == b\"\\x89PNG\\r\\n\\x1a\\n\":\n        return \".png\"\n    if h[:6] in (b\"GIF87a\", b\"GIF89a\"):\n        return \".gif\"\n    if h[:4] == b\"RIFF\" and raw[8:12] == b\"WEBP\":\n        return \".webp\"\n    if h[:4] == b\"RIFF\" and raw[8:12] == b\"WAVE\":\n        return \".wav\"\n    if h[4:8] == b\"ftyp\":\n        return \".mp4\"\n    if h[:4] == b\"OggS\":\n        return \".ogg\"\n    if h[:3] == b\"ID3\":\n        return \".mp3\"\n    if h[:4] == b\"%PDF\":\n        return \".pdf\"\n    if h[:4] == b\"PK\\x03\\x04\":\n        return \".zip\"\n    if h[:2] == b\"BM\":\n        return \".bmp\"\n    if h[:2] == b\"AM\":\n        return \".amr\"\n    if h[:2] == b\"#!\":\n        return \".silk\"\n    return \"\"\n\n\ndef media_daemon():\n    try:\n        os.makedirs(MEDIA_DIR, exist_ok=True)\n    except Exception:\n        pass\n    while True:\n        try:\n            names = os.listdir(MEDIA_DIR) if os.path.isdir(MEDIA_DIR) else []\n        except Exception:\n            names = []\n        for fn in names:\n            if fn.startswith(\"cp_\") and fn.endswith(\".json\"):\n                _cpjd = None\n                try:\n                    _cpjd = json.load(open(os.path.join(MEDIA_DIR, fn), encoding=\"utf-8\"))\n                except Exception:\n                    _cpjd = None\n                if _cpjd:\n                    try:\n                        _real_dst = _cpjd[\"rdst\"]\n                        os.makedirs(os.path.dirname(_real_dst), exist_ok=True)\n                        import shutil\n                        shutil.copyfile(_cpjd[\"src\"], _real_dst)\n                        wlog(\"CP_OK \" + _real_dst)\n                    except Exception as _ce:\n                        wlog(\"CP_ERR \" + str(_ce)[:100])\n                try:\n                    os.remove(os.path.join(MEDIA_DIR, fn))\n                except Exception:\n                    pass\n                continue\n            if not fn.startswith(\"job_\") or not fn.endswith(\".json\"):\n                continue\n            jp = os.path.join(MEDIA_DIR, fn)\n            tag = fn[4:-5]\n            try:\n                job = json.load(open(jp, encoding=\"utf-8\"))\n            except Exception:\n                try:\n                    os.remove(jp)\n                except Exception:\n                    pass\n                continue\n            try:\n                req = urllib.request.Request(job[\"url\"])\n                req.add_header(\"User-Agent\", \"Mozilla/5.0\")\n                with urllib.request.urlopen(req, timeout=120) as r:\n                    cl = r.headers.get(\"Content-Length\")\n                    if cl and int(cl) > 67108864:\n                        raise Exception(\"file too large: \" + str(cl))\n                    chunks = []\n                    got = 0\n                    while True:\n                        part = r.read(262144)\n                        if not part:\n                            break\n                        got += len(part)\n                        if got > 67108864:\n                            raise Exception(\"file too large: \" + str(got))\n                        chunks.append(part)\n                    raw = b\"\".join(chunks)\n                kh = (job.get(\"key\") or \"\").strip()\n                if kh and len(kh) == 32:\n                    from Crypto.Cipher import AES\n                    from Crypto.Util.Padding import unpad\n                    raw = unpad(AES.new(bytes.fromhex(kh), AES.MODE_ECB).decrypt(raw), 16)\n                out_path = job[\"out\"]\n                if not os.path.splitext(out_path)[1]:\n                    out_path = out_path + guess_ext(raw)\n                with open(out_path, \"wb\") as f:\n                    f.write(raw)\n                with open(os.path.join(MEDIA_DIR, \"done_\" + tag + \".json\"), \"w\", encoding=\"utf-8\") as f:\n                    json.dump({\"ok\": True, \"path\": out_path}, f)\n                wlog(\"MEDIA_OK \" + out_path + \" \" + str(len(raw)))\n            except Exception as e:\n                try:\n                    with open(os.path.join(MEDIA_DIR, \"done_\" + tag + \".json\"), \"w\", encoding=\"utf-8\") as f:\n                        json.dump({\"ok\": False, \"err\": str(e)[:120]}, f)\n                except Exception:\n                    pass\n                wlog(\"MEDIA_ERR \" + str(e)[:120])\n            try:\n                os.remove(jp)\n            except Exception:\n                pass\n        time.sleep(0.3)\n\n\ndef get_ticket(name, token, base):\n    with TK_LOCK:\n        if name in TICKET:\n            return TICKET[name]\n    try:\n        d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n        uid = d.get(\"wechatUserId\") or \"\"\n        j = post(base + \"/ilink/bot/getconfig\",\n                 {\"ilink_user_id\": uid, \"context_token\": \"\", \"base_info\": {\"channel_version\": \"2.0.0\"}},\n                 mx_headers(token), 15)\n        tk = j.get(\"typing_ticket\") or \"\"\n        if tk:\n            with TK_LOCK:\n                TICKET[name] = tk\n        return tk\n    except Exception as e:\n        wlog(\"TK_ERR \" + name + \" \" + str(e)[:100])\n        return \"\"\n\n\ndef send_typing(name, token, base, status):\n    tk = get_ticket(name, token, base)\n    if not tk:\n        return False\n    try:\n        d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n        uid = d.get(\"wechatUserId\") or \"\"\n        post(base + \"/ilink/bot/sendtyping\",\n             {\"ilink_user_id\": uid, \"typing_ticket\": tk, \"status\": status,\n              \"base_info\": {\"channel_version\": \"2.0.0\"}}, mx_headers(token), 10)\n        return True\n    except Exception as e:\n        wlog(\"TP_ERR \" + name + \" s=\" + str(status) + \" \" + str(e)[:80])\n        return False\n\n\ndef typing_daemon():\n    active = {}\n    while True:\n        try:\n            names = os.listdir(TYPING_DIR) if os.path.isdir(TYPING_DIR) else []\n        except Exception:\n            names = []\n        now = time.time()\n        for fn in names:\n            if not fn.endswith(\".json\"):\n                continue\n            name = fn[:-5]\n            try:\n                age = now - os.path.getmtime(os.path.join(TYPING_DIR, fn))\n            except Exception:\n                age = 999\n            if age > 30:\n                try:\n                    os.remove(os.path.join(TYPING_DIR, fn))\n                except Exception:\n                    pass\n                if name in active:\n                    info = active.pop(name)\n                    send_typing(info[0], info[1], info[2], 2)\n                continue\n            if name in active:\n                info = active[name]\n                if now - info[3] >= TK_MS / 1000.0:\n                    send_typing(info[0], info[1], info[2], 1)\n                    active[name] = (info[0], info[1], info[2], now, info[4] + 1)\n            else:\n                try:\n                    d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n                    tok = d.get(\"wechatToken\") or d.get(\"token\") or \"\"\n                    base = (d.get(\"baseUrl\") or \"https://ilinkai.weixin.qq.com\").rstrip(\"/\")\n                except Exception:\n                    continue\n                if not tok:\n                    continue\n                send_typing(name, tok, base, 1)\n                active[name] = (name, tok, base, now, 1)\n        for name in list(active.keys()):\n            if name not in [x[:-5] for x in names if x.endswith(\".json\")]:\n                info = active.pop(name)\n                send_typing(info[0], info[1], info[2], 2)\n        time.sleep(0.4)\n\n\ndef load_seen(name):\n    # 去重集合持久化到磁盘，进程重启后仍然有效；\n    # 之前只在内存里维护、超过 2000 条直接 clear()，导致旧消息被当成新消息重复消费。\n    p = HUB + \"/accounts/\" + name + \"/seen_ids.txt\"\n    try:\n        with open(p, encoding=\"utf-8\") as f:\n            return set(x.strip() for x in f if x.strip())\n    except Exception:\n        return set()\n\n\ndef save_seen(name):\n    p = HUB + \"/accounts/\" + name + \"/seen_ids.txt\"\n    try:\n        with SEEN_LOCK:\n            ids = list(SEEN)\n        # 超过上限时只保留最近的一半，而不是全部清空\n        if len(ids) > 3000:\n            ids = ids[-1500:]\n            with SEEN_LOCK:\n                SEEN.clear()\n                SEEN.update(ids)\n        os.makedirs(os.path.dirname(p), exist_ok=True)\n        with open(p, \"w\", encoding=\"utf-8\") as f:\n            f.write(chr(10).join(ids))\n    except Exception:\n        pass\n\n\ndef poll(acc, lane):\n    name = acc.get(\"name\") or \"\"\n    token = acc.get(\"token\") or \"\"\n    base = (acc.get(\"baseUrl\") or \"https://ilinkai.weixin.qq.com\").rstrip(\"/\")\n    if not name or not token:\n        return\n    if lane > 0:\n        time.sleep(lane * GAP)\n    path = HUB + \"/accounts/\" + name + \"/sync_buf.txt\"\n    # 每条车道用独立游标，避免三条线程互相覆盖进度导致重复拉取或漏拉。\n    # 车道 0 沿用原文件名以兼容历史数据。\n    if lane > 0:\n        lane_path = HUB + \"/accounts/\" + name + \"/sync_buf_\" + str(lane) + \".txt\"\n        if not os.path.exists(lane_path) and os.path.exists(path):\n            try:\n                import shutil as _sh\n                _sh.copyfile(path, lane_path)\n            except Exception:\n                pass\n        path = lane_path\n    try:\n        buf = open(path, encoding=\"utf-8\").read().strip()\n    except Exception:\n        buf = \"\"\n    with SEEN_LOCK:\n        if not SEEN:\n            SEEN.update(load_seen(name))\n    h = mx_headers(token)\n    wlog(\"LANE \" + name + \" #\" + str(lane) + \" START\")\n    while True:\n        try:\n            j = post(base + \"/ilink/bot/getupdates\", {\"get_updates_buf\": buf,\n                     \"base_info\": {\"channel_version\": \"2.0.0\"}}, h, 40)\n            nb = j.get(\"get_updates_buf\") or \"\"\n            if nb and nb != buf:\n                buf = nb\n                with BUF_LOCK:\n                    try:\n                        open(path, \"w\", encoding=\"utf-8\").write(nb)\n                    except Exception:\n                        pass\n            msgs = j.get(\"msgs\") or j.get(\"message_list\") or []\n            if msgs:\n                wrote = 0\n                try:\n                    with open(INBOX, \"a\", encoding=\"utf-8\") as f:\n                        for m in msgs:\n                            _mid = mid_of(m)\n                            _dup = False\n                            if _mid:\n                                with SEEN_LOCK:\n                                    if _mid in SEEN:\n                                        _dup = True\n                                    else:\n                                        SEEN.add(_mid)\n                            if _dup:\n                                continue\n                            f.write(json.dumps({\"acc\": name, \"m\": m}, ensure_ascii=False) + chr(10))\n                            wrote += 1\n                except Exception as e2:\n                    wlog(\"WRITE_ERR \" + str(e2)[:80])\n                if wrote:\n                    save_seen(name)\n                wlog(\"GET \" + name + \" lane=\" + str(lane) + \" n=\" + str(len(msgs)) + \" new=\" + str(wrote))\n        except Exception as e:\n            wlog(\"ERR \" + name + \"#\" + str(lane) + \" \" + str(e)[:120])\n            time.sleep(3)\n\n\ndef main():\n    try:\n        os.makedirs(TYPING_DIR, exist_ok=True)\n        os.makedirs(MEDIA_DIR, exist_ok=True)\n    except Exception:\n        pass\n    threading.Thread(target=typing_daemon, daemon=True).start()\n    threading.Thread(target=media_daemon, daemon=True).start()\n    try:\n        cfgs = json.load(open(HUB + \"/wxpoll_cfg.json\", encoding=\"utf-8\"))\n    except Exception as e:\n        wlog(\"NO_CFG \" + str(e)[:100])\n        cfgs = []\n    for acc in cfgs:\n        for lane in range(LANES):\n            threading.Thread(target=poll, args=(acc, lane), daemon=True).start()\n    wlog(\"STARTED\")\n    while True:\n        time.sleep(60)\n\n\nif __name__ == \"__main__\":\n    main()";
 var WXPOLL_PATH = "/mnt/android/sdcard/Download/Operit/bridge_hub/wxpoll.py";
 var WX_INBOX = HUB + "wx_inbox.jsonl";
 var __inboxOff = 0;
@@ -1670,18 +1722,72 @@ async function handleTool(name, p) {
                 steps.push({ name: "附件", ok: !!_tag, detail: _tag ? String(_tag).slice(0, 160) : "构造失败" });
                 _q = _tag ? ("这张图里是什么？ " + _tag) : "这张图里是什么？";
             }
-            // 走真实 process 链路，确认标签位置处理生效
-            var _avat = [];
-            if (p.attach && p.mode === "param") {
-                var _sp2 = String(p.attach).replace("/storage/emulated/0", "/mnt/android/sdcard");
-                var _if3 = null;
-                try { _if3 = await Tools.Files.info(_sp2); } catch (e3) { }
-                if (_if3) {
-                    _avat.push({ filePath: _sp2, fileName: _an, mimeType: __mimeOf(_ap, ""), fileSize: Number(_if3.size || 0), content: _sp2, nodeId: ATTACH_NODE });
-                }
-                _q = "这张图里是什么？";
+            if (p.mode === "api2") {
+                var _o = {};
+                try { _o.copy = String(Tools.Files.copy).slice(0,200); } catch(e){ _o.copyErr = errText(e); }
+                try { _o.cfgDir = ToolPkg.getConfigDir(); } catch(e){ _o.cfgErr = errText(e); }
+                try { _o.dataDir = ToolPkg.getLocalDataDir(); } catch(e){ _o.dataErr = errText(e); }
+                try { _o.sendMsg = String(Tools.Chat.sendMessage).slice(0,200); } catch(e){}
+                return { success: true, api2: _o };
             }
-            var rep = await process(ac5, "selftest", "selftest", "selftest-" + Date.now(), _q, cid5, _avat);
+            if (p.mode === "api2") {
+                var _o = {};
+                try { _o.copy = String(Tools.Files.copy).slice(0,200); } catch(e){ _o.copyErr = errText(e); }
+                try { _o.cfgDir = ToolPkg.getConfigDir(); } catch(e){ _o.cfgErr = errText(e); }
+                try { _o.dataDir = ToolPkg.getLocalDataDir(); } catch(e){ _o.dataErr = errText(e); }
+                try { _o.sendMsg = String(Tools.Chat.sendMessage).slice(0,200); } catch(e){}
+                return { success: true, api2: _o };
+            }
+            if (p.mode === "api") {
+                var _out = {};
+                try {
+                    _out.tools = Object.keys(typeof Tools !== "undefined" ? Tools : {});
+                    if (Tools && Tools.Chat) _out.chat = Object.keys(Tools.Chat);
+                    if (Tools && Tools.Files) _out.files = Object.keys(Tools.Files);
+                    if (Tools && Tools.Input) _out.input = Object.keys(Tools.Input);
+                } catch (eA) { _out.err = errText(eA); }
+                try { _out.toolpkg = Object.keys(typeof ToolPkg !== "undefined" ? ToolPkg : {}); } catch (eB) { }
+                return { success: true, api: _out };
+            }
+            if (p.mode === "api") {
+                var _out = {};
+                try {
+                    _out.tools = Object.keys(typeof Tools !== "undefined" ? Tools : {});
+                    if (Tools && Tools.Chat) _out.chat = Object.keys(Tools.Chat);
+                    if (Tools && Tools.Files) _out.files = Object.keys(Tools.Files);
+                    if (Tools && Tools.Input) _out.input = Object.keys(Tools.Input);
+                } catch (eA) { _out.err = errText(eA); }
+                try { _out.toolpkg = Object.keys(typeof ToolPkg !== "undefined" ? ToolPkg : {}); } catch (eB) { }
+                return { success: true, api: _out };
+            }
+            if (p.mode === "vision") {
+                var _vp = String(p.attach);
+                var _v = {};
+                try {
+                    var _b = await Tools.Files.readBinary(_vp);
+                    _v.type = typeof _b;
+                    var _s = (typeof _b === "string") ? _b : ((_b && (_b.base64 || _b.data || _b.content)) || "");
+                    _v.len = String(_s).length;
+                    _v.head = String(_s).slice(0, 40);
+                    _v.vkeys = Object.keys(_b || {}).slice(0, 10);
+                } catch (eV) { _v.err = errText(eV); }
+                return { success: true, vision: _v };
+            }
+            if (p.mode === "vision") {
+                var _vp = String(p.attach);
+                var _v = {};
+                try {
+                    var _b = await Tools.Files.readBinary(_vp);
+                    _v.type = typeof _b;
+                    var _s = (typeof _b === "string") ? _b : ((_b && (_b.base64 || _b.data || _b.content)) || "");
+                    _v.len = String(_s).length;
+                    _v.head = String(_s).slice(0, 40);
+                    _v.vkeys = Object.keys(_b || {}).slice(0, 10);
+                } catch (eV) { _v.err = errText(eV); }
+                return { success: true, vision: _v };
+            }
+            // 走真实 process 链路，确认标签位置处理生效
+            var rep = await process(ac5, "selftest", "selftest", "selftest-" + Date.now(), _q, cid5, []);
             steps.push({ name: "AI 回复", ok: !!rep, detail: (Date.now() - t0) + "ms, " + String(rep || "").length + " 字" });
             return { success: true, ok: !!rep, detail: rep ? ("已通，用时 " + (Date.now() - t0) + "ms") : "无回复", steps: steps, reply: rep || "" };
         }
