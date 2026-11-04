@@ -16,7 +16,7 @@
         { "name": "bridge_poll", "parameters": [ { "name": "account", "type": "string", "required": false } ] },
         { "name": "bridge_pump", "parameters": [] },
         { "name": "bridge_qr", "parameters": [ { "name": "text", "type": "string", "required": true } ] },
-        { "name": "bridge_test", "parameters": [ { "name": "account", "type": "string", "required": true } ] },
+        { "name": "bridge_test", "parameters": [ { "name": "account", "type": "string", "required": true }, { "name": "attach", "type": "string", "required": false }, { "name": "mode", "type": "string", "required": false } ] },
         { "name": "bridge_wechat_import", "parameters": [ { "name": "account", "type": "string", "required": true } ] }
                             ]
 }
