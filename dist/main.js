@@ -125,6 +125,74 @@ async function ask(chatId, text) {
     return __pickText(result);
 }
 
+
+var MEDIA_DIR = HUB + "media/";
+var MEDIA_KEEP_N = 100;
+var MEDIA_KEEP_MS = 7 * 86400000;
+var __mediaCleanAt = 0;
+
+function __mediaExt(ct) {
+    var s = String(ct || "").toLowerCase();
+    if (s.indexOf("png") >= 0) return ".png";
+    if (s.indexOf("gif") >= 0) return ".gif";
+    if (s.indexOf("webp") >= 0) return ".webp";
+    return ".jpg";
+}
+
+async function __mediaClean() {
+    try {
+        var lr = await Tools.Files.list(MEDIA_DIR);
+        var arr = (lr && (lr.entries || lr.items || lr.list)) || (Array.isArray(lr) ? lr : []);
+        if (!arr.length) return;
+        var files = [];
+        for (var i = 0; i < arr.length; i++) {
+            var e = arr[i] || {};
+            var nm = String(e.name || e.fileName || "");
+            if (!nm || nm === "." || nm === "..") continue;
+            if (!/\.(jpg|jpeg|png|gif|webp)$/i.test(nm)) continue;
+            var mt = Number(e.lastModified || e.mtime || e.modifiedTime || 0);
+            if (mt && mt < 1e11) mt = mt * 1000;
+            files.push({ name: nm, mtime: mt || 0 });
+        }
+        files.sort(function (a, b) { return b.mtime - a.mtime; });
+        var now = Date.now();
+        var killed = 0;
+        for (var k = 0; k < files.length; k++) {
+            var f = files[k];
+            var tooOld = f.mtime && (now - f.mtime > MEDIA_KEEP_MS);
+            var tooMany = k >= MEDIA_KEEP_N;
+            if (!tooOld && !tooMany) continue;
+            try { await Tools.Files.delete(MEDIA_DIR + f.name); killed++; } catch (eD) { }
+        }
+        if (killed) await rlog("MEDIA_CLEAN " + killed + " left=" + (files.length - killed));
+    } catch (e) { }
+}
+
+async function __mediaSave(name, bytes, ext) {
+    var p = MEDIA_DIR + name + (ext || ".jpg");
+    try {
+        await Tools.Files.mkdir(MEDIA_DIR);
+    } catch (e0) { }
+    try {
+        if (Tools.Files.writeBinary) {
+            await Tools.Files.writeBinary(p, bytes);
+        } else {
+            await writeFile(p, bytes);
+        }
+        return p;
+    } catch (e) {
+        await rlog("MEDIA_SAVE_ERR " + errText(e));
+        return "";
+    }
+}
+
+async function __httpBinary(url, headers) {
+    var r = await Tools.Net.http({ url: url, method: "GET", headers: headers || {},
+        connect_timeout: 20, read_timeout: 60, responseType: "binary", follow_redirects: true });
+    if (!r || r.statusCode < 200 || r.statusCode >= 300) throw new Error("HTTP " + (r && r.statusCode));
+    return r.content;
+}
+
 function __splitLong(t, limit) {
     if (!t) return [];
     if (t.length <= limit) return [t];
@@ -264,7 +332,7 @@ async function process(name, channel, from, id, text, chatId) {
         await rlog("ASK_START " + name + " q=" + t0);
         var _ch = (channel === "wechat") ? "微信" : ((channel === "qq") ? "QQ" : "公开接口");
         var _body = __cleanText(text);
-        if (!_body) { await rlog("ASK_EMPTY " + name + " " + id); return ""; }
+        if (!_body) { await rlog("ASK_EMPTY " + name + " " + id); return "__EMPTY__"; }
         var payload = _body + String.fromCharCode(10) + String.fromCharCode(10) + "[" + _ch + " " + name + "]";
         try {
             var acc = await ask(chatId, payload);
@@ -383,12 +451,57 @@ async function wxReply(a, to, ctx, text) {
     }
 }
 
+async function __wxImage(a, m, msgId) {
+    try {
+        var items = m.item_list || [];
+        var img = null;
+        for (var i = 0; i < items.length; i++) {
+            if (items[i] && items[i].type === 2 && items[i].image_item) { img = items[i].image_item; break; }
+        }
+        if (!img) return "";
+        var media = img.media || {};
+        var url = media.full_url || "";
+        if (!url) { await rlog("WX_IMG_NO_URL " + a.name); return ""; }
+        var keyHex = String(img.aeskey || "").trim();
+        var tag = String(msgId).replace(/[^a-zA-Z0-9]/g, "").slice(-20) + "_" + Date.now();
+        var jobP = MEDIA_DIR + "job_" + tag + ".json";
+        var outName = "wx_" + tag + ".jpg";
+        try { await Tools.Files.mkdir(MEDIA_DIR); } catch (e0) { }
+        await writeFile(jobP, JSON.stringify({ url: url, key: keyHex, out: MEDIA_DIR + outName }));
+        await rlog("WX_IMG_QUEUED " + a.name + " " + outName);
+        for (var w = 0; w < 40; w++) {
+            await sleep(250);
+            try {
+                var rj = await readFile(MEDIA_DIR + "done_" + tag + ".json");
+                if (rj) {
+                    var jd = JSON.parse(rj);
+                    try { await Tools.Files.delete(MEDIA_DIR + "done_" + tag + ".json"); } catch (eD) { }
+                    if (jd && jd.ok) { await rlog("WX_IMG " + a.name + " ok " + jd.path); return jd.path; }
+                    await rlog("WX_IMG_FAIL " + a.name + " " + String(jd && jd.err));
+                    return "";
+                }
+            } catch (eR) { }
+        }
+        await rlog("WX_IMG_TIMEOUT " + a.name);
+        return "";
+    } catch (e) {
+        await rlog("WX_IMG_ERR " + errText(e));
+        return "";
+    }
+}
 async function wxHandle(a, gen, m) {
     var _isHttp = !!(a.cfg && a.cfg.channel === "http");
     var id = _isHttp ? (m.id || m.msg_id || "") : pickId(m);
     var text = _isHttp ? (m.text || "") : pickText(m);
     var from = _isHttp ? (m.from || m.from_user_id || "") : (m.from_user_id || m.from || "");
-    if (!id || !text) return;
+    var _hasImg = false;
+    if (!_isHttp) { var _il = m.item_list || []; for (var _ii = 0; _ii < _il.length; _ii++) { if (_il[_ii] && _il[_ii].type === 2 && _il[_ii].image_item) { _hasImg = true; break; } } }
+    if (!id || (!text && !_hasImg)) return;
+    var _imgPath = "";
+    if (_hasImg) {
+        _imgPath = await __wxImage(a, m, id);
+        text = text ? (text + String.fromCharCode(10) + "[图片] " + (_imgPath || "[图片下载失败]")) : ("[图片] " + (_imgPath || "[图片下载失败]"));
+    }
     var key = a.name + "|" + id;
     if (state.seen.indexOf(key) >= 0) return;
     state.received++;
@@ -396,6 +509,7 @@ async function wxHandle(a, gen, m) {
     try { pushEvent(a.name, id, from, text); } catch (e0) {}
     if (!_isHttp) { void wxTypingKeep(a, from, m.context_token || ""); }
     var acc = await process(a.name, _isHttp ? "http" : "wechat", from, id, text, (state.chatFix && state.chatFix[a.name]) || a.chatId);
+    if (acc === "__EMPTY__") { state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen(); if (!_isHttp) { void wxTypingStop(a, from); } return; }
     if (!acc) {
         if (!_isHttp) { void wxTypingStop(a, from); }
         state.retryN = state.retryN || {};
@@ -584,6 +698,25 @@ async function qqFrame(a, gen, f) {
         }
     }
 }
+async function __qqImage(a, atts, msgId) {
+    try {
+        var one = null;
+        for (var i = 0; i < atts.length; i++) {
+            var ct = String((atts[i] || {}).content_type || "");
+            if (ct.indexOf("image/") === 0) { one = atts[i]; break; }
+        }
+        if (!one || !one.url) return "";
+        var buf = await __httpBinary(one.url, { "User-Agent": "Mozilla/5.0" });
+        var tag = String(msgId).replace(/[^a-zA-Z0-9]/g, "").slice(-20) + "_" + Date.now();
+        var p = await __mediaSave("qq_" + tag, buf, __mediaExt(one.content_type));
+        if (p) await rlog("QQ_IMG " + a.name + " ok " + p);
+        return p;
+    } catch (e) {
+        await rlog("QQ_IMG_ERR " + errText(e));
+        return "";
+    }
+}
+
 async function qqMessage(a, gen, type, body) {
     var scene = type === "C2C_MESSAGE_CREATE" ? "c2c" : "group";
     var author = body.author || {};
@@ -591,13 +724,27 @@ async function qqMessage(a, gen, type, body) {
     var groupOpenid = String(body.group_openid || "");
     var id = String(body.id || "");
     var text = String(body.content || "").trim();
-    if (!id || !text) return;
+    var _atts = body.attachments || [];
+    if (_atts.length) {
+        try { await writeFile(HUB + "qq_last.json", JSON.stringify(body, null, 1)); } catch (eW) { }
+        var _ts = [];
+        for (var _ai = 0; _ai < _atts.length; _ai++) { _ts.push(String(_atts[_ai].content_type || "?")); }
+        await rlog("QQ_RAW " + a.name + " atts=" + _atts.length + " types=" + _ts.join(","));
+    }
+    if (!id || (!text && !_atts.length)) return;
+    var _qimg = "";
+    if (_atts.length) {
+        _qimg = await __qqImage(a, _atts, id);
+        var _ipt = "[图片] " + (_qimg || "[图片下载失败]");
+        text = text ? (text + String.fromCharCode(10) + _ipt) : _ipt;
+    }
     var key = a.name + "|" + id;
     if (state.seen.indexOf(key) >= 0) return;
     state.received++;
     await rlog("QQ_RECV " + a.name + " " + id + " from=" + from + " len=" + text.length);
     try { pushEvent(a.name, id, from, text); } catch (e0) {}
     var acc = await process(a.name, "qq", from, id, text, (state.chatFix && state.chatFix[a.name]) || a.chatId);
+    if (acc === "__EMPTY__") { state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen(); return; }
     if (!acc) { await rlog("QQ_REQUEUE " + a.name + " " + id); return; }
     state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen();
     state.replied++;
@@ -637,7 +784,7 @@ async function startHttp(acc, gen) {
 
 var GW_SRC = "#!/usr/bin/env python3\nimport json, sys, os, re, queue, uuid, argparse, threading, time\nfrom http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n\nHUB = \"/storage/emulated/0/Download/Operit/bridge_hub\"\nRTLOG = HUB + \"/rt.log\"\n\ndef trim_log():\n    try:\n        if os.path.getsize(RTLOG) > 524288:\n            with open(RTLOG, \"r\", encoding=\"utf-8\", errors=\"ignore\") as f:\n                tail = f.readlines()[-300:]\n            with open(RTLOG, \"w\", encoding=\"utf-8\") as f:\n                f.writelines(tail)\n    except Exception:\n        pass\n\ndef wlog(msg):\n    try:\n        trim_log()\n        with open(RTLOG, \"a\", encoding=\"utf-8\") as f:\n            f.write(time.strftime(\"%H:%M:%S \", time.localtime()) + msg + \"\\n\")\n    except Exception:\n        pass\n\nclass PortState(object):\n    def __init__(self, port, key, allow_public):\n        self.port = port\n        self.key = key or \"\"\n        self.allow_public = bool(allow_public)\n        self.q = queue.Queue()\n        self.pend = {}\n        self.lock = threading.Lock()\n\ndef make_handler(st):\n    class H(BaseHTTPRequestHandler):\n        def log_message(self, *a): pass\n        def _out(self, code, obj):\n            b = json.dumps(obj, ensure_ascii=False).encode(\"utf-8\")\n            self.send_response(code)\n            self.send_header(\"Content-Type\", \"application/json; charset=utf-8\")\n            self.send_header(\"Content-Length\", str(len(b)))\n            self.end_headers()\n            self.wfile.write(b)\n        def _lan(self):\n            if st.allow_public: return True\n            ip = self.client_address[0]\n            if ip.startswith((\"127.\", \"10.\", \"192.168.\", \"fe80\", \"::1\")): return True\n            return re.match(r\"^172\\.(1[6-9]|2\\d|3[01])\\.\", ip) is not None\n        def _auth(self):\n            if not st.key: return True\n            h = self.headers.get(\"Authorization\", \"\")\n            if h.startswith(\"Bearer \"): h = h[7:]\n            return h == st.key\n        def _read_chunked(self):\n            data = b\"\"\n            while True:\n                line = self.rfile.readline().strip()\n                if not line: break\n                try: n = int(line.split(b\";\")[0], 16)\n                except Exception: break\n                if n == 0:\n                    try: self.rfile.readline()\n                    except Exception: pass\n                    break\n                data += self.rfile.read(n)\n                try: self.rfile.readline()\n                except Exception: pass\n            return data\n        def _body(self):\n            try:\n                te = (self.headers.get(\"Transfer-Encoding\") or \"\").lower()\n                if \"chunked\" in te:\n                    return json.loads(self._read_chunked().decode(\"utf-8\") or \"{}\")\n                n = int(self.headers.get(\"Content-Length\", \"0\"))\n                return json.loads(self.rfile.read(n).decode(\"utf-8\") or \"{}\")\n            except Exception:\n                return {}\n        def do_GET(self):\n            if not self._lan(): return self._out(403, {\"error\": \"public access disabled\"})\n            p = self.path.split(\"?\")[0]\n            if p in (\"/health\", \"/\"):\n                return self._out(200, {\"ok\": True, \"service\": \"operit-gw\", \"port\": st.port, \"auth\": bool(st.key), \"public\": st.allow_public, \"pending\": len(st.pend), \"queued\": st.q.qsize()})\n            if p == \"/v1/models\":\n                return self._out(200, {\"object\": \"list\", \"data\": [{\"id\": \"operit-bridge\", \"object\": \"model\"}]})\n            return self._out(404, {\"error\": \"not found\"})\n        def do_POST(self):\n            ip = self.client_address[0]\n            if not self._lan():\n                wlog(\"GW 403-public \" + ip + \" \" + self.path)\n                return self._out(403, {\"error\": \"public access disabled\"})\n            p = self.path.split(\"?\")[0]\n            body = self._body()\n            if p.endswith(\"/log\"):\n                if not (ip.startswith(\"127.\") or ip in (\"::1\", \"localhost\")):\n                    wlog(\"GW 403-log \" + ip)\n                    return self._out(403, {\"error\": \"log only from localhost\"})\n                try:\n                    lines = body.get(\"lines\") or []\n                    if isinstance(lines, str): lines = [lines]\n                    with open(RTLOG, \"a\", encoding=\"utf-8\") as f:\n                        for ln in lines: f.write(str(ln) + \"\\n\")\n                except Exception:\n                    pass\n                trim_log()\n                return self._out(200, {\"errcode\": 0})\n            if not self._auth():\n                wlog(\"GW 401 \" + ip + \" \" + p)\n                return self._out(401, {\"error\": {\"message\": \"invalid api key\", \"type\": \"auth\"}})\n            if p.endswith(\"/chat/completions\"):\n                text = \"\"\n                for m in (body.get(\"messages\") or []):\n                    c = m.get(\"content\")\n                    if isinstance(c, list): c = \"\".join([x.get(\"text\", \"\") for x in c if isinstance(x, dict)])\n                    if m.get(\"role\") == \"user\": text = c or \"\"\n                if not text: return self._out(400, {\"error\": {\"message\": \"empty message\"}})\n                rid = \"gw-\" + uuid.uuid4().hex[:16]\n                src = body.get(\"user\") or (\"port-%d\" % st.port)\n                q = queue.Queue()\n                with st.lock: st.pend[rid] = q\n                st.q.put({\"id\": rid, \"from\": src, \"text\": text})\n                wlog(\"GW QUEUE %s from=%s len=%d\" % (rid, src, len(text)))\n                t0 = time.time()\n                try:\n                    reply = q.get(timeout=int(body.get(\"timeout\", 120)))\n                except queue.Empty:\n                    with st.lock: st.pend.pop(rid, None)\n                    wlog(\"GW TIMEOUT %s %.1fs\" % (rid, time.time() - t0))\n                    return self._out(504, {\"error\": {\"message\": \"operit timeout\"}})\n                wlog(\"GW DONE %s %.1fs len=%d\" % (rid, time.time() - t0, len(reply or \"\")))\n                return self._out(200, {\"id\": \"chatcmpl-\" + rid, \"object\": \"chat.completion\", \"model\": body.get(\"model\") or \"operit-bridge\",\n                    \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": reply}, \"finish_reason\": \"stop\"}],\n                    \"usage\": {\"prompt_tokens\": 0, \"completion_tokens\": 0, \"total_tokens\": 0}})\n            if p.endswith(\"/getupdates\"):\n                msgs = []\n                while len(msgs) < 10:\n                    try: msgs.append(st.q.get_nowait())\n                    except queue.Empty: break\n                if msgs: wlog(\"GW PULL %d pending=%d\" % (len(msgs), len(st.pend)))\n                return self._out(200, {\"errcode\": 0, \"get_updates_buf\": str(st.port), \"msgs\": msgs})\n            if p.endswith(\"/sendmessage\"):\n                rid = body.get(\"reply_to\") or \"\"\n                with st.lock: q = st.pend.pop(rid, None)\n                if q: q.put(body.get(\"text\") or \"\")\n                wlog(\"GW PUSH %s delivered=%s len=%d\" % (rid, bool(q), len(body.get(\"text\") or \"\")))\n                return self._out(200, {\"errcode\": 0, \"delivered\": bool(q)})\n            return self._out(404, {\"errcode\": 404})\n    return H\n\ndef serve(cfg):\n    st = PortState(cfg[\"port\"], cfg.get(\"key\", \"\"), cfg.get(\"allow_public\", False))\n    srv = ThreadingHTTPServer((\"0.0.0.0\", st.port), make_handler(st))\n    print(\"gw listening %d key=%s public=%s\" % (st.port, bool(st.key), st.allow_public), flush=True)\n    wlog(\"GW LISTEN port=%d auth=%s public=%s\" % (st.port, bool(st.key), st.allow_public))\n    srv.serve_forever()\n\nif __name__ == \"__main__\":\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--config\", default=\"\")\n    ap.add_argument(\"--port\", type=int, default=0)\n    ap.add_argument(\"--key\", default=\"\")\n    ap.add_argument(\"--allow-public\", action=\"store_true\")\n    a = ap.parse_args()\n    if a.config and os.path.exists(a.config):\n        cfgs = json.load(open(a.config, encoding=\"utf-8\"))\n    else:\n        cfgs = [{\"port\": a.port or 8789, \"key\": a.key, \"allow_public\": a.allow_public}]\n    print(\"gw started %d ports\" % len(cfgs), flush=True)\n    wlog(\"GW BOOT ports=%d\" % len(cfgs))\n    for c in cfgs:\n        t = threading.Thread(target=serve, args=(c,), daemon=True)\n        t.start()\n    threading.Event().wait()\n";
 var GW_PATH = "/mnt/android/sdcard/Download/Operit/bridge_hub/gw.py";
-var WXPOLL_SRC = "# -*- coding: utf-8 -*-\nimport json, time, os, sys, threading\nimport urllib.request\n\nHUB = \"/storage/emulated/0/Download/Operit/bridge_hub\"\nINBOX = HUB + \"/wx_inbox.jsonl\"\nTYPING_DIR = HUB + \"/typing\"\nBUF_LOCK = threading.Lock()\nSEEN = set()\nSEEN_LOCK = threading.Lock()\nLANES = 3\nGAP = 6\nTK_MS = 1500\nTICKET = {}\nTK_LOCK = threading.Lock()\n\ndef wlog(m):\n    try:\n        with open(HUB + \"/wxpoll.log\", \"a\", encoding=\"utf-8\") as f:\n            f.write(time.strftime(\"%H:%M:%S \", time.localtime()) + str(m) + chr(10))\n    except Exception:\n        pass\n\ndef post(url, body, headers, timeout=40):\n    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method=\"POST\")\n    with urllib.request.urlopen(req, timeout=timeout) as r:\n        return json.loads(r.read().decode(\"utf-8\"))\n\ndef mid_of(m):\n    v = m.get(\"msg_id\")\n    if v:\n        return str(v)\n    try:\n        it = (m.get(\"item_list\") or [])[0]\n        if isinstance(it, dict) and it.get(\"msg_id\"):\n            return str(it[\"msg_id\"])\n    except Exception:\n        pass\n    return str(m.get(\"message_id\") or \"\")\n\ndef mx_headers(token):\n    return {\"Content-Type\": \"application/json\", \"Authorization\": \"Bearer \" + token,\n            \"AuthorizationType\": \"ilink_bot_token\", \"User-Agent\": \"operit-bridge-wxpoll\"}\n\ndef get_ticket(name, token, base):\n    with TK_LOCK:\n        if name in TICKET:\n            return TICKET[name]\n    try:\n        d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n        uid = d.get(\"wechatUserId\") or \"\"\n        j = post(base + \"/ilink/bot/getconfig\",\n                 {\"ilink_user_id\": uid, \"context_token\": \"\", \"base_info\": {\"channel_version\": \"2.0.0\"}},\n                 mx_headers(token), 15)\n        tk = j.get(\"typing_ticket\") or \"\"\n        if tk:\n            with TK_LOCK:\n                TICKET[name] = tk\n        return tk\n    except Exception as e:\n        wlog(\"TK_ERR \" + name + \" \" + str(e)[:100])\n        return \"\"\n\ndef send_typing(name, token, base, status):\n    tk = get_ticket(name, token, base)\n    if not tk:\n        return False\n    try:\n        d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n        uid = d.get(\"wechatUserId\") or \"\"\n        post(base + \"/ilink/bot/sendtyping\",\n             {\"ilink_user_id\": uid, \"typing_ticket\": tk, \"status\": status,\n              \"base_info\": {\"channel_version\": \"2.0.0\"}}, mx_headers(token), 10)\n        return True\n    except Exception as e:\n        wlog(\"TP_ERR \" + name + \" s=\" + str(status) + \" \" + str(e)[:80])\n        return False\n\ndef typing_daemon():\n    active = {}\n    while True:\n        try:\n            names = os.listdir(TYPING_DIR) if os.path.isdir(TYPING_DIR) else []\n        except Exception:\n            names = []\n        now = time.time()\n        for fn in names:\n            if not fn.endswith(\".json\"):\n                continue\n            name = fn[:-5]\n            try:\n                age = now - os.path.getmtime(os.path.join(TYPING_DIR, fn))\n            except Exception:\n                age = 999\n            if age > 30:\n                try:\n                    os.remove(os.path.join(TYPING_DIR, fn))\n                except Exception:\n                    pass\n                if name in active:\n                    info = active.pop(name)\n                    send_typing(info[0], info[1], info[2], 2)\n                    wlog(\"TP_STOP \" + name + \" (stale)\")\n                continue\n            if name in active:\n                info = active[name]\n                if now - info[3] >= TK_MS / 1000.0:\n                    send_typing(info[0], info[1], info[2], 1)\n                    active[name] = (info[0], info[1], info[2], now, info[4] + 1)\n            else:\n                try:\n                    d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n                    tok = d.get(\"wechatToken\") or d.get(\"token\") or \"\"\n                    base = (d.get(\"baseUrl\") or \"https://ilinkai.weixin.qq.com\").rstrip(\"/\")\n                except Exception:\n                    continue\n                if not tok:\n                    continue\n                send_typing(name, tok, base, 1)\n                active[name] = (name, tok, base, now, 1)\n                wlog(\"TP_START \" + name)\n        for name in list(active.keys()):\n            if name not in [x[:-5] for x in names if x.endswith(\".json\")]:\n                info = active.pop(name)\n                send_typing(info[0], info[1], info[2], 2)\n                wlog(\"TP_STOP \" + name + \" n=\" + str(info[4]))\n        time.sleep(0.4)\n\ndef poll(acc, lane):\n    name = acc.get(\"name\") or \"\"\n    token = acc.get(\"token\") or \"\"\n    base = (acc.get(\"baseUrl\") or \"https://ilinkai.weixin.qq.com\").rstrip(\"/\")\n    if not name or not token:\n        return\n    if lane > 0:\n        time.sleep(lane * GAP)\n    path = HUB + \"/accounts/\" + name + \"/sync_buf.txt\"\n    try:\n        buf = open(path, encoding=\"utf-8\").read().strip()\n    except Exception:\n        buf = \"\"\n    h = mx_headers(token)\n    wlog(\"LANE \" + name + \" #\" + str(lane) + \" START\")\n    while True:\n        try:\n            j = post(base + \"/ilink/bot/getupdates\", {\"get_updates_buf\": buf,\n                     \"base_info\": {\"channel_version\": \"2.0.0\"}}, h, 40)\n            nb = j.get(\"get_updates_buf\") or \"\"\n            if nb and nb != buf:\n                buf = nb\n                with BUF_LOCK:\n                    try:\n                        open(path, \"w\", encoding=\"utf-8\").write(nb)\n                    except Exception:\n                        pass\n            msgs = j.get(\"msgs\") or j.get(\"message_list\") or []\n            if msgs:\n                try:\n                    with open(INBOX, \"a\", encoding=\"utf-8\") as f:\n                        for m in msgs:\n                            _mid = mid_of(m)\n                            _dup = False\n                            if _mid:\n                                with SEEN_LOCK:\n                                    if _mid in SEEN:\n                                        _dup = True\n                                    else:\n                                        SEEN.add(_mid)\n                                        if len(SEEN) > 2000:\n                                            SEEN.clear()\n                            if _dup:\n                                continue\n                            f.write(json.dumps({\"acc\": name, \"m\": m}, ensure_ascii=False) + chr(10))\n                except Exception as e2:\n                    wlog(\"WRITE_ERR \" + str(e2)[:80])\n                wlog(\"GET \" + name + \" lane=\" + str(lane) + \" n=\" + str(len(msgs)))\n        except Exception as e:\n            wlog(\"ERR \" + name + \"#\" + str(lane) + \" \" + str(e)[:120])\n            time.sleep(3)\n\ndef main():\n    try:\n        os.makedirs(TYPING_DIR, exist_ok=True)\n    except Exception:\n        pass\n    threading.Thread(target=typing_daemon, daemon=True).start()\n    try:\n        cfgs = json.load(open(HUB + \"/wxpoll_cfg.json\", encoding=\"utf-8\"))\n    except Exception as e:\n        wlog(\"NO_CFG \" + str(e)[:100])\n        cfgs = []\n    for acc in cfgs:\n        for lane in range(LANES):\n            threading.Thread(target=poll, args=(acc, lane), daemon=True).start()\n    wlog(\"TYPD START\")\n    while True:\n        time.sleep(60)\n\nif __name__ == \"__main__\":\n    main()\n";
+var WXPOLL_SRC = "# -*- coding: utf-8 -*-\nimport json, time, os, sys, threading\nimport urllib.request\n\nHUB = \"/storage/emulated/0/Download/Operit/bridge_hub\"\nINBOX = HUB + \"/wx_inbox.jsonl\"\nTYPING_DIR = HUB + \"/typing\"\nMEDIA_DIR = HUB + \"/media\"\nBUF_LOCK = threading.Lock()\nSEEN = set()\nSEEN_LOCK = threading.Lock()\nLANES = 3\nGAP = 6\nTK_MS = 1500\nTICKET = {}\nTK_LOCK = threading.Lock()\n\n\ndef wlog(m):\n    try:\n        with open(HUB + \"/wxpoll.log\", \"a\", encoding=\"utf-8\") as f:\n            f.write(time.strftime(\"%H:%M:%S \", time.localtime()) + str(m) + chr(10))\n    except Exception:\n        pass\n\n\ndef post(url, body, headers, timeout=40):\n    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method=\"POST\")\n    with urllib.request.urlopen(req, timeout=timeout) as r:\n        return json.loads(r.read().decode(\"utf-8\"))\n\n\ndef mid_of(m):\n    v = m.get(\"msg_id\")\n    if v:\n        return str(v)\n    try:\n        it = (m.get(\"item_list\") or [])[0]\n        if isinstance(it, dict) and it.get(\"msg_id\"):\n            return str(it[\"msg_id\"])\n    except Exception:\n        pass\n    return str(m.get(\"message_id\") or \"\")\n\n\ndef mx_headers(token):\n    return {\"Content-Type\": \"application/json\", \"Authorization\": \"Bearer \" + token,\n            \"AuthorizationType\": \"ilink_bot_token\", \"User-Agent\": \"operit-bridge-wxpoll\"}\n\n\ndef get_ticket(name, token, base):\n    with TK_LOCK:\n        if name in TICKET:\n            return TICKET[name]\n    try:\n        d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n        uid = d.get(\"wechatUserId\") or \"\"\n        j = post(base + \"/ilink/bot/getconfig\",\n                 {\"ilink_user_id\": uid, \"context_token\": \"\", \"base_info\": {\"channel_version\": \"2.0.0\"}},\n                 mx_headers(token), 15)\n        tk = j.get(\"typing_ticket\") or \"\"\n        if tk:\n            with TK_LOCK:\n                TICKET[name] = tk\n        return tk\n    except Exception as e:\n        wlog(\"TK_ERR \" + name + \" \" + str(e)[:100])\n        return \"\"\n\n\ndef send_typing(name, token, base, status):\n    tk = get_ticket(name, token, base)\n    if not tk:\n        return False\n    try:\n        d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n        uid = d.get(\"wechatUserId\") or \"\"\n        post(base + \"/ilink/bot/sendtyping\",\n             {\"ilink_user_id\": uid, \"typing_ticket\": tk, \"status\": status,\n              \"base_info\": {\"channel_version\": \"2.0.0\"}}, mx_headers(token), 10)\n        return True\n    except Exception as e:\n        wlog(\"TP_ERR \" + name + \" s=\" + str(status) + \" \" + str(e)[:80])\n        return False\n\n\ndef typing_daemon():\n    active = {}\n    while True:\n        try:\n            names = os.listdir(TYPING_DIR) if os.path.isdir(TYPING_DIR) else []\n        except Exception:\n            names = []\n        now = time.time()\n        for fn in names:\n            if not fn.endswith(\".json\"):\n                continue\n            name = fn[:-5]\n            try:\n                age = now - os.path.getmtime(os.path.join(TYPING_DIR, fn))\n            except Exception:\n                age = 999\n            if age > 30:\n                try:\n                    os.remove(os.path.join(TYPING_DIR, fn))\n                except Exception:\n                    pass\n                if name in active:\n                    info = active.pop(name)\n                    send_typing(info[0], info[1], info[2], 2)\n                    wlog(\"TP_STOP \" + name + \" (stale)\")\n                continue\n            if name in active:\n                info = active[name]\n                if now - info[3] >= TK_MS / 1000.0:\n                    send_typing(info[0], info[1], info[2], 1)\n                    active[name] = (info[0], info[1], info[2], now, info[4] + 1)\n            else:\n                try:\n                    d = json.load(open(HUB + \"/accounts/\" + name + \"/account.json\", encoding=\"utf-8\"))\n                    tok = d.get(\"wechatToken\") or d.get(\"token\") or \"\"\n                    base = (d.get(\"baseUrl\") or \"https://ilinkai.weixin.qq.com\").rstrip(\"/\")\n                except Exception:\n                    continue\n                if not tok:\n                    continue\n                send_typing(name, tok, base, 1)\n                active[name] = (name, tok, base, now, 1)\n                wlog(\"TP_START \" + name)\n        for name in list(active.keys()):\n            if name not in [x[:-5] for x in names if x.endswith(\".json\")]:\n                info = active.pop(name)\n                send_typing(info[0], info[1], info[2], 2)\n                wlog(\"TP_STOP \" + name + \" n=\" + str(info[4]))\n        time.sleep(0.4)\n\n\ndef media_daemon():\n    try:\n        os.makedirs(MEDIA_DIR, exist_ok=True)\n    except Exception:\n        pass\n    while True:\n        try:\n            names = os.listdir(MEDIA_DIR) if os.path.isdir(MEDIA_DIR) else []\n        except Exception:\n            names = []\n        for fn in names:\n            if not fn.startswith(\"job_\") or not fn.endswith(\".json\"):\n                continue\n            jp = os.path.join(MEDIA_DIR, fn)\n            tag = fn[4:-5]\n            try:\n                job = json.load(open(jp, encoding=\"utf-8\"))\n            except Exception:\n                try:\n                    os.remove(jp)\n                except Exception:\n                    pass\n                continue\n            try:\n                req = urllib.request.Request(job[\"url\"])\n                req.add_header(\"User-Agent\", \"Mozilla/5.0\")\n                with urllib.request.urlopen(req, timeout=40) as r:\n                    raw = r.read()\n                kh = (job.get(\"key\") or \"\").strip()\n                if kh and len(kh) == 32:\n                    from Crypto.Cipher import AES\n                    from Crypto.Util.Padding import unpad\n                    raw = unpad(AES.new(bytes.fromhex(kh), AES.MODE_ECB).decrypt(raw), 16)\n                open(job[\"out\"], \"wb\").write(raw)\n                json.dump({\"ok\": True, \"path\": job[\"out\"]},\n                          open(os.path.join(MEDIA_DIR, \"done_\" + tag + \".json\"), \"w\", encoding=\"utf-8\"))\n                wlog(\"MEDIA_OK \" + job[\"out\"] + \" \" + str(len(raw)))\n            except Exception as e:\n                json.dump({\"ok\": False, \"err\": str(e)[:120]},\n                          open(os.path.join(MEDIA_DIR, \"done_\" + tag + \".json\"), \"w\", encoding=\"utf-8\"))\n                wlog(\"MEDIA_ERR \" + str(e)[:120])\n            try:\n                os.remove(jp)\n            except Exception:\n                pass\n        time.sleep(0.3)\n\n\ndef poll(acc, lane):\n    name = acc.get(\"name\") or \"\"\n    token = acc.get(\"token\") or \"\"\n    base = (acc.get(\"baseUrl\") or \"https://ilinkai.weixin.qq.com\").rstrip(\"/\")\n    if not name or not token:\n        return\n    if lane > 0:\n        time.sleep(lane * GAP)\n    path = HUB + \"/accounts/\" + name + \"/sync_buf.txt\"\n    try:\n        buf = open(path, encoding=\"utf-8\").read().strip()\n    except Exception:\n        buf = \"\"\n    h = mx_headers(token)\n    wlog(\"LANE \" + name + \" #\" + str(lane) + \" START\")\n    while True:\n        try:\n            j = post(base + \"/ilink/bot/getupdates\", {\"get_updates_buf\": buf,\n                     \"base_info\": {\"channel_version\": \"2.0.0\"}}, h, 40)\n            nb = j.get(\"get_updates_buf\") or \"\"\n            if nb and nb != buf:\n                buf = nb\n                with BUF_LOCK:\n                    try:\n                        open(path, \"w\", encoding=\"utf-8\").write(nb)\n                    except Exception:\n                        pass\n            msgs = j.get(\"msgs\") or j.get(\"message_list\") or []\n            if msgs:\n                try:\n                    with open(INBOX, \"a\", encoding=\"utf-8\") as f:\n                        for m in msgs:\n                            _mid = mid_of(m)\n                            _dup = False\n                            if _mid:\n                                with SEEN_LOCK:\n                                    if _mid in SEEN:\n                                        _dup = True\n                                    else:\n                                        SEEN.add(_mid)\n                                        if len(SEEN) > 2000:\n                                            SEEN.clear()\n                            if _dup:\n                                continue\n                            f.write(json.dumps({\"acc\": name, \"m\": m}, ensure_ascii=False) + chr(10))\n                except Exception as e2:\n                    wlog(\"WRITE_ERR \" + str(e2)[:80])\n                wlog(\"GET \" + name + \" lane=\" + str(lane) + \" n=\" + str(len(msgs)))\n        except Exception as e:\n            wlog(\"ERR \" + name + \"#\" + str(lane) + \" \" + str(e)[:120])\n            time.sleep(3)\n\n\ndef main():\n    try:\n        os.makedirs(TYPING_DIR, exist_ok=True)\n        os.makedirs(MEDIA_DIR, exist_ok=True)\n    except Exception:\n        pass\n    threading.Thread(target=typing_daemon, daemon=True).start()\n    threading.Thread(target=media_daemon, daemon=True).start()\n    try:\n        cfgs = json.load(open(HUB + \"/wxpoll_cfg.json\", encoding=\"utf-8\"))\n    except Exception as e:\n        wlog(\"NO_CFG \" + str(e)[:100])\n        cfgs = []\n    for acc in cfgs:\n        for lane in range(LANES):\n            threading.Thread(target=poll, args=(acc, lane), daemon=True).start()\n    wlog(\"TYPD START\")\n    while True:\n        time.sleep(60)\n\n\nif __name__ == \"__main__\":\n    main()\n";
 var WXPOLL_PATH = "/mnt/android/sdcard/Download/Operit/bridge_hub/wxpoll.py";
 var WX_INBOX = HUB + "wx_inbox.jsonl";
 var __inboxOff = 0;
@@ -681,6 +828,7 @@ async function wxInboxTick() {
             try { await wxHandle(rt2, state.gen, o.m); } catch (e1) { await rlog("WX_INBOX_ERR " + errText(e1)); }
         }
         if (__inboxOff > 200000) { try { await writeFile(WX_INBOX, ""); __inboxOff = 0; } catch (e2) { } }
+        if (!__mediaCleanAt || Date.now() - __mediaCleanAt > 3600000) { __mediaCleanAt = Date.now(); void __mediaClean(); }
     } catch (e) { }
 }
 
@@ -850,7 +998,7 @@ async function statusSnapshot() {
 }
 
 var QR_SRC = "import sys, json, base64, io\nimport segno\n\n# 目标像素尺寸：与 UI 里 WebView 的可用宽度匹配，避免被裁切\nTARGET_PX = 600\n\nargfile = sys.argv[1]\ntext = io.open(argfile, encoding='utf-8').read().strip()\nif not text:\n    print(json.dumps({\"success\": False, \"error\": \"empty\"}))\n    sys.exit(0)\n\nqr = segno.make(text, error='m')\n\ndef png_with_target(qr, target=TARGET_PX, border=2):\n    # segno 的 scale 是每个模块的像素数；先按 scale=1 估算模块数，再反推 scale\n    n = qr.symbol_size(scale=1, border=border)[0]\n    if not n or n <= 0:\n        n = 40\n    scale = max(2, int(target / float(n)))\n    buf = io.BytesIO()\n    qr.save(buf, kind='png', scale=scale, border=border)\n    return buf.getvalue(), n, scale\n\n# 优先 PNG\ntry:\n    png, n, scale = png_with_target(qr)\n    b64 = base64.b64encode(png).decode('ascii')\n    print(json.dumps({\n        \"success\": True,\n        \"data_uri\": \"data:image/png;base64,\" + b64,\n        \"fmt\": \"png\",\n        \"modules\": n,\n        \"scale\": scale,\n        \"px\": n * scale\n    }))\n    sys.exit(0)\nexcept Exception as e:\n    png_err = str(e)\n\n# 回退 SVG\ntry:\n    buf2 = io.BytesIO()\n    qr.save(buf2, kind='svg', scale=6, border=2)\n    svg = buf2.getvalue().decode('utf-8')\n    b64 = base64.b64encode(svg.encode('utf-8')).decode('ascii')\n    print(json.dumps({\"success\": True, \"data_uri\": \"data:image/svg+xml;base64,\" + b64, \"fmt\": \"svg\", \"png_error\": png_err}))\n    sys.exit(0)\nexcept Exception as e2:\n    print(json.dumps({\"success\": False, \"error\": \"png:\" + png_err + \" svg:\" + str(e2)}))";
-var VER = "1.2.18";
+var VER = "1.5.18";
 
 async function readJsonSafe(p, def) { try { var t = await readFile(p); if (!t) return def; return JSON.parse(t); } catch (e) { return def; } }
 async function writeJson(p, obj) { return await writeFile(p, JSON.stringify(obj, null, 2)); }
