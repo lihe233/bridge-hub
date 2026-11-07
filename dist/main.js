@@ -42,15 +42,18 @@ async function readFile(p) {
     return "";
 }
 var SEEN_PATH = HUB + "rt_seen.json";
+// [fix] 内存里 state.seen 最多保留 1024 条，但原先只持久化最后 500 条，
+// 重启后丢失 524 条去重记录，可能造成旧消息被重复处理。改为与内存上限一致。
+var SEEN_KEEP = 1024;
 async function saveSeen() {
-    try { var arr = state.seen.slice(-500); await writeFile(SEEN_PATH, JSON.stringify(arr)); } catch (e) {}
+    try { var arr = state.seen.slice(-SEEN_KEEP); await writeFile(SEEN_PATH, JSON.stringify(arr)); } catch (e) {}
 }
 async function loadSeen() {
     try {
         var txt = await readFile(SEEN_PATH);
         if (!txt) return;
         var arr = JSON.parse(txt);
-        if (Array.isArray(arr)) { state.seen = arr.slice(-500); await rlog("SEEN_LOAD " + state.seen.length); }
+        if (Array.isArray(arr)) { state.seen = arr.slice(-SEEN_KEEP); await rlog("SEEN_LOAD " + state.seen.length); }
     } catch (e) {}
 }
 var __logChain = Promise.resolve();
@@ -59,9 +62,33 @@ function rlog(msg) {
     try { state.logLines.push(line); if (state.logLines.length > 400) state.logLines.shift(); } catch (e) { }
     __logChain = __logChain.then(async function () {
         try {
-            var old = await readFile(HUB + "rt.log");
-            if (old.length > 300000) old = old.slice(-150000);
-            await writeFile(HUB + "rt.log", old + line + String.fromCharCode(10));
+            // [fix] 原先每条日志都「读整个 rt.log + 整体写回」，300KB 时单条要读写
+            // 各 300KB，总开销 O(n^2)。改为先追加写；只在文件确实超限时才读一次做截断。
+            var appended = false;
+            try {
+                if (typeof Tools.Files.append === "function") {
+                    await Tools.Files.append(HUB + "rt.log", line + String.fromCharCode(10));
+                    appended = true;
+                    state.io = "Files.append";
+                }
+            } catch (eA) { appended = false; }
+            if (!appended) {
+                var old = await readFile(HUB + "rt.log");
+                if (old.length > 300000) old = old.slice(-150000);
+                await writeFile(HUB + "rt.log", old + line + String.fromCharCode(10));
+            }
+            __logWritten = (__logWritten || 0) + 1;
+            if (__logWritten % 200 === 0) {
+                // 定期检查体积，超限时截断一次，避免无限增长
+                try {
+                    var inf = await Tools.Files.info(HUB + "rt.log");
+                    var sz = Number((inf && (inf.size || (inf.details && inf.details.size))) || 0);
+                    if (sz > 300000) {
+                        var cur = await readFile(HUB + "rt.log");
+                        await writeFile(HUB + "rt.log", cur.slice(-150000));
+                    }
+                } catch (eT) { }
+            }
         } catch (eL) { }
     });
     return __logChain;
@@ -100,27 +127,39 @@ async function ask(chatId, text, atts) {
     Tools.Chat.sendMessage(req).then(function (r) { done = true; result = r; })
         .catch(function (e) { done = true; result = { __err: errText(e) }; });
     var idleN = 0;
+    var hardHit = false;
     while (!done) {
         await sleep(3000);
         if (done) break;
         var el = Date.now() - t0;
         var busy = true;
+        var st = null;
         try {
-            var st = await Tools.Chat.agentStatus(chatId);
+            st = await Tools.Chat.agentStatus(chatId);
             busy = !!(st && (st.executing || st.running || st.isExecuting));
         } catch (e) { busy = true; }
-        if (busy) { idleN = 0; }
-        else {
+        if (busy) {
+            idleN = 0;
+        } else {
             idleN++;
-            if (idleN >= 3) { await rlog("ASK_IDLE " + chatId + " ms=" + el); break; }
+            if (idleN === 3) {
+                await rlog("ASK_IDLE_OBSERVED " + chatId + " ms=" + el + " st=" + JSON.stringify(st || {}).slice(0, 160));
+            }
         }
-        if (el > hard) { await rlog("ASK_HARD_TIMEOUT " + chatId + " ms=" + el); break; }
+        if (el > hard) {
+            hardHit = true;
+            await rlog("ASK_HARD_TIMEOUT " + chatId + " ms=" + el + " st=" + JSON.stringify(st || {}).slice(0, 160));
+            break;
+        }
     }
-    if (!done) {
-        try { await Tools.Chat.cancel(chatId); } catch (e) { }
+    if (!done && hardHit) {
+        await rlog("ASK_CANCEL_BEGIN " + chatId + " ms=" + (Date.now() - t0));
+        try { await Tools.Chat.cancel(chatId); } catch (e) { await rlog("ASK_CANCEL_ERR " + chatId + " " + errText(e)); }
+        await rlog("ASK_CANCEL_DONE " + chatId + " ms=" + (Date.now() - t0));
         var waitN = 0;
-        while (!done && waitN < 10) { await sleep(1000); waitN++; }
+        while (!done && waitN < 20) { await sleep(1000); waitN++; }
     }
+    await rlog("ASK_SETTLE " + chatId + " done=" + done + " hard=" + hardHit + " ms=" + (Date.now() - t0));
     if (result && result.__err) throw new Error(result.__err);
     if (result === null || result === undefined) return "";
     return __pickText(result);
@@ -357,11 +396,12 @@ async function process(name, channel, from, id, text, chatId, atts) {
     if (chatId) {
         var _stillBusy = false;
         try {
-            for (var _bw = 0; _bw < 120; _bw++) {
+            for (var _bw = 0; _bw < 6; _bw++) {
                 var stb = await Tools.Chat.agentStatus(chatId);
                 var _b = !!(stb && (stb.executing || stb.running || stb.isExecuting));
                 _stillBusy = _b;
                 if (!_b) break;
+                if (_bw === 5) await rlog("CHAT_BUSY_OBSERVED " + name + " st=" + JSON.stringify(stb || {}).slice(0, 160));
                 await sleep(2500);
             }
         } catch (e) { }
@@ -977,6 +1017,19 @@ async function qqMessage(a, gen, type, body) {
         text = _clean2 ? (_clean2 + " " + _qqTags.join(" ")) : _qqTags.join(" ");
     }
     var acc = await process(a.name, "qq", from, id, text, (state.chatFix && state.chatFix[a.name]) || a.chatId, []);
+    // [fix] QQ 通道原先失败后只记 QQ_REQUEUE 就结束，state.retry 仅由 wxLoopOnce 消费，
+    // 而 wxLoopOnce 受 a.running 门控、QQ 根本没有这条驱动，因此重试永远不会发生。
+    // 这里改为就地有限重试（最多 2 次，间隔 2s），与微信侧重试次数一致。
+    if (!acc) {
+        for (var _qqr = 1; _qqr <= 2 && !acc; _qqr++) {
+            await rlog("QQ_RETRY " + a.name + " " + id + " try=" + _qqr);
+            await sleep(2000);
+            if (!(state.running && a.running && gen === state.gen)) break;
+            try {
+                acc = await process(a.name, "qq", from, id, text, (state.chatFix && state.chatFix[a.name]) || a.chatId, []);
+            } catch (eR2) { await rlog("QQ_RETRY_ERR " + a.name + " " + errText(eR2)); }
+        }
+    }
     if (acc === "__EMPTY__") { state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen(); return; }
     if (!acc) { await rlog("QQ_REQUEUE " + a.name + " " + id); return; }
     state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen();
@@ -1140,7 +1193,7 @@ async function restore() {
     try {
         if (state.running) return;
         var cfg = state.cfgOverride ? state.cfgOverride : normalize(await loadJson(CFG_PATH, DEFAULT_CFG));
-        state.cfgOverride = cfg;
+        state.cfgOverride = cfg; state.cfg = cfg;
         state.running = true; state.gen++;
         var gen = state.gen;
         await loadSeen();
