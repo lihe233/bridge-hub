@@ -29,6 +29,23 @@ try { ToolPkg.ipc.on(CHANNEL, handleRequest); } catch (e) { try { console.log("[
 
 function errText(e) { return String(e && e.message ? e.message : e); }
 function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+// [fix] 拼 shell 命令前统一单引号转义：账号名/回收站目录名来自 UI 输入，
+// 含空格或单引号会让命令拆错，理论上还能注入。
+function shq(s) {
+    return "'" + String(s === null || s === undefined ? "" : s).replace(/'/g, "'" + String.fromCharCode(92, 39) + "'") + "'";
+}
+// [fix] 平台 agentStatus 实际返回的是 {isIdle, isProcessing, state:"processing"}，
+// 旧代码查的 executing / running / isExecuting 三个字段根本不存在，
+// 于是永远判「不忙」——这就是 9 秒后掐掉正在生成那一轮的直接原因。
+// 这里统一成一个判定函数，新旧字段都认。
+function __isBusy(st) {
+    if (!st) return false;
+    if (st.executing || st.running || st.isExecuting) return true;
+    if (st.isProcessing) return true;
+    if (st.isIdle === false) return true;
+    var sc = String(st.state || "");
+    return sc === "processing" || sc === "executing" || sc === "running";
+}
 
 async function writeFile(p, c) {
     var txt = String(c);
@@ -56,42 +73,52 @@ async function loadSeen() {
         if (Array.isArray(arr)) { state.seen = arr.slice(-SEEN_KEEP); await rlog("SEEN_LOAD " + state.seen.length); }
     } catch (e) {}
 }
-var __logChain = Promise.resolve();
+// [fix] 日志改为缓冲批量写。原先每条日志都要先读一次 rt.log 再整体写回
+// （300KB 时单条就是 600KB IO，整体 O(n^2)），而且依赖 Tools.Files.append 是否存在。
+// 现在攒最多 800ms 一次写入，并按累计字节轮转体积。
+var __logBuf = [];
+var __logTimer = null;
+var __logBusy = false;
+var __logBytes = 0;
+async function __flushLog() {
+    if (__logBusy) return;
+    if (!__logBuf.length) return;
+    __logBusy = true;
+    var chunk = __logBuf.join("");
+    __logBuf = [];
+    try {
+        var appended = false;
+        try {
+            if (typeof Tools.Files.append === "function") {
+                await Tools.Files.append(HUB + "rt.log", chunk);
+                appended = true;
+                state.io = "Files.append";
+            }
+        } catch (eA) { appended = false; }
+        if (!appended) {
+            var old = await readFile(HUB + "rt.log");
+            if (old.length > 300000) old = old.slice(-150000);
+            await writeFile(HUB + "rt.log", old + chunk);
+        }
+        __logBytes += chunk.length;
+        if (__logBytes > 150000) {
+            __logBytes = 0;
+            try {
+                var cur = await readFile(HUB + "rt.log");
+                if (cur.length > 300000) await writeFile(HUB + "rt.log", cur.slice(-150000));
+            } catch (eT) { }
+        }
+    } catch (eL) { } finally { __logBusy = false; }
+}
 function rlog(msg) {
     var line = new Date().toISOString().slice(11, 19) + " " + msg;
     try { state.logLines.push(line); if (state.logLines.length > 400) state.logLines.shift(); } catch (e) { }
-    __logChain = __logChain.then(async function () {
-        try {
-            // [fix] 原先每条日志都「读整个 rt.log + 整体写回」，300KB 时单条要读写
-            // 各 300KB，总开销 O(n^2)。改为先追加写；只在文件确实超限时才读一次做截断。
-            var appended = false;
-            try {
-                if (typeof Tools.Files.append === "function") {
-                    await Tools.Files.append(HUB + "rt.log", line + String.fromCharCode(10));
-                    appended = true;
-                    state.io = "Files.append";
-                }
-            } catch (eA) { appended = false; }
-            if (!appended) {
-                var old = await readFile(HUB + "rt.log");
-                if (old.length > 300000) old = old.slice(-150000);
-                await writeFile(HUB + "rt.log", old + line + String.fromCharCode(10));
-            }
-            __logWritten = (__logWritten || 0) + 1;
-            if (__logWritten % 200 === 0) {
-                // 定期检查体积，超限时截断一次，避免无限增长
-                try {
-                    var inf = await Tools.Files.info(HUB + "rt.log");
-                    var sz = Number((inf && (inf.size || (inf.details && inf.details.size))) || 0);
-                    if (sz > 300000) {
-                        var cur = await readFile(HUB + "rt.log");
-                        await writeFile(HUB + "rt.log", cur.slice(-150000));
-                    }
-                } catch (eT) { }
-            }
-        } catch (eL) { }
-    });
-    return __logChain;
+    try { __logBuf.push(line + String.fromCharCode(10)); } catch (eB) { }
+    if (!__logTimer) {
+        try { __logTimer = setTimeout(function () { __logTimer = null; void __flushLog(); }, 800); }
+        catch (eS) { void __flushLog(); }
+    }
+    return Promise.resolve();
 }
 var PLOG = HUB + "rt_plugin.log";
 async function loadJson(p, def) { try { var t = await readFile(p); if (!t) return def; return JSON.parse(t); } catch (e) { return def; } }
@@ -124,10 +151,20 @@ async function ask(chatId, text, atts) {
     var t0 = Date.now();
     var done = false;
     var result = null;
+    // [fix] 记录注入前的消息条数，后面只认「这条之后」的 AI 消息，
+    // 避免把上一轮的旧回复当成本轮结果重复发出去。
+    var _baseN = 0;
+    try {
+        var _bm = await Tools.Chat.getMessages(chatId, { order: "asc" });
+        _baseN = (_bm && _bm.messages) ? _bm.messages.length : 0;
+    } catch (eB0) { _baseN = 0; }
     Tools.Chat.sendMessage(req).then(function (r) { done = true; result = r; })
         .catch(function (e) { done = true; result = { __err: errText(e) }; });
     var idleN = 0;
     var hardHit = false;
+    var dbText = "";
+    var dbLen = -1;
+    var dbStable = 0;
     while (!done) {
         await sleep(3000);
         if (done) break;
@@ -136,7 +173,7 @@ async function ask(chatId, text, atts) {
         var st = null;
         try {
             st = await Tools.Chat.agentStatus(chatId);
-            busy = !!(st && (st.executing || st.running || st.isExecuting));
+            busy = __isBusy(st);
         } catch (e) { busy = true; }
         if (busy) {
             idleN = 0;
@@ -146,11 +183,30 @@ async function ask(chatId, text, atts) {
                 await rlog("ASK_IDLE_OBSERVED " + chatId + " ms=" + el + " st=" + JSON.stringify(st || {}).slice(0, 160));
             }
         }
+        // [fix] 平台有时整轮结束也不 resolve sendMessage（ask 会一直挂着，
+        // 于是这条回复根本不会发给 QQ）。这里同时盯数据库：只要本轮之后的 AI
+        // 正文已经出现、长度两次一致且平台不忙，就当这一轮完成，直接用库里的正文。
+        try {
+            var _txt = await __lastAiText(chatId, _baseN);
+            if (_txt) {
+                if (_txt.length === dbLen) dbStable++; else { dbStable = 0; dbLen = _txt.length; }
+                if (dbStable >= 1 && !busy) {
+                    dbText = _txt;
+                    await rlog("ASK_DB_READY " + chatId + " len=" + _txt.length + " ms=" + el);
+                    break;
+                }
+            } else { dbLen = -1; dbStable = 0; }
+        } catch (eD) { }
         if (el > hard) {
             hardHit = true;
             await rlog("ASK_HARD_TIMEOUT " + chatId + " ms=" + el + " st=" + JSON.stringify(st || {}).slice(0, 160));
             break;
         }
+    }
+    // 从库里读到正文就不用 cancel，也不用再等 Promise
+    if (!done && dbText) {
+        await rlog("ASK_FROM_DB " + chatId + " len=" + dbText.length + " ms=" + (Date.now() - t0));
+        return dbText;
     }
     if (!done && hardHit) {
         await rlog("ASK_CANCEL_BEGIN " + chatId + " ms=" + (Date.now() - t0));
@@ -158,11 +214,296 @@ async function ask(chatId, text, atts) {
         await rlog("ASK_CANCEL_DONE " + chatId + " ms=" + (Date.now() - t0));
         var waitN = 0;
         while (!done && waitN < 20) { await sleep(1000); waitN++; }
+        // [fix] cancel 之后必须等平台真的空闲再放行，否则队列里的下一条消息注入
+        // 会再次抢占还没停下来的这一轮，症状仍然是「思考有、正文空」。
+        var idleWait = 0;
+        while (idleWait < 30) {
+            var stI = null;
+            try { stI = await Tools.Chat.agentStatus(chatId); } catch (eI) { break; }
+            var bI = __isBusy(stI);
+            if (!bI) break;
+            await sleep(1000);
+            idleWait++;
+        }
+        if (idleWait >= 30) await rlog("ASK_STILL_BUSY " + chatId);
     }
     await rlog("ASK_SETTLE " + chatId + " done=" + done + " hard=" + hardHit + " ms=" + (Date.now() - t0));
     if (result && result.__err) throw new Error(result.__err);
     if (result === null || result === undefined) return "";
     return __pickText(result);
+}
+
+// [fix] 从对话里取回「最后一条用户消息之后」的 AI 正文。
+// 用于失败重试：不再把同一条消息重新注入对话（那会产生重复的用户气泡、
+// 还可能抢占上一轮），只把已经生成好的正文读回来。
+async function __lastAiText(chatId, fromIdx) {
+    if (!chatId) return "";
+    try {
+        var r = await Tools.Chat.getMessages(chatId, { order: "asc" });
+        var arr = (r && r.messages) || [];
+        var _start = Number(fromIdx || 0);
+        if (_start < 0) _start = 0;
+        for (var i = arr.length - 1; i >= _start; i--) {
+            var m = arr[i] || {};
+            var sd = String(m.sender || "");
+            if (sd === "user") break;
+            if (sd === "ai" || sd === "assistant") {
+                return String(m.content || "").trim();
+            }
+        }
+    } catch (e) { await rlog("LASTAI_ERR " + chatId + " " + errText(e)); }
+    return "";
+}
+async function __recoverReply(chatId, tries) {
+    var n = Number(tries || 3);
+    for (var i = 0; i < n; i++) {
+        var t = await __lastAiText(chatId);
+        if (t) return t;
+        if (i < n - 1) await sleep(2000);
+    }
+    return "";
+}
+
+// ===== 未送达回复补偿（启动时回头补发） =====
+// 场景：插件/App 在「AI 已经生成完、还没发到 QQ」的这段时间被重启或被杀，
+// 于是对话里有正文、手机上却收不到。这里在启动后扫一遍最近对话，
+// 把「最后一条 AI 正文、且台账里没记过已发」的补发出去。
+var SENT_PATH = HUB + "sent_state.json";
+async function __sentLoad() { return await readJsonSafe(SENT_PATH, {}); }
+// [fix] 原来用消息 timestamp 判断「发没发过」，但平台返回的 timestamp 并不可靠
+// （实测台账里会是好几天前的值），导致刚漏掉的回复被判成「已发」而跳过。
+// 改成给正文算一个内容指纹：内容相同就认为已发过，内容不同就补发。
+function __hashText(t) {
+    var s2 = String(t === null || t === undefined ? "" : t);
+    var probe = s2.length > 400 ? (s2.slice(0, 200) + "|" + s2.slice(-200)) : s2;
+    var h = 0;
+    for (var i = 0; i < probe.length; i++) {
+        h = ((h << 5) - h + probe.charCodeAt(i)) | 0;
+    }
+    return String(h) + ":" + String(s2.length);
+}
+async function __sentMarkHash(name, hash, len) {
+    try {
+        var d = await readJsonSafe(SENT_PATH, {});
+        d[name] = { lastHash: String(hash || ""), len: Number(len || 0), at: Date.now() };
+        await writeJson(SENT_PATH, d);
+    } catch (e) { }
+}
+async function __sentMark(name, ts) {
+    // 兼容旧调用：拿不到正文时只更新时间，不覆盖指纹
+    try {
+        var d = await readJsonSafe(SENT_PATH, {});
+        var cur = d[name] || {};
+        cur.at = Date.now();
+        if (ts && !cur.lastHash) cur.lastTs = Number(ts) || Date.now();
+        d[name] = cur;
+        await writeJson(SENT_PATH, d);
+    } catch (e) { }
+}
+function __tsMs(v) {
+    var t = Number(v || 0);
+    if (!t) return 0;
+    return t < 1e12 ? Math.round(t * 1000) : Math.round(t);
+}
+async function __peerSave(name, obj) {
+    try { await writeJson(HUB + "accounts/" + name + "/last_peer.json", obj); } catch (e) { }
+}
+// [fix] 统一投递出口。原实现有两个发送方（正常回复 / 启动补偿），
+// 台账又是在「发完之后」才写，于是两边都能通过检查 → 用户收到两条一样的消息。
+// 现在改为「发送前先预占指纹」：谁先占到谁发，后来者看到指纹相同直接跳过。
+async function __deliverOnce(name, channel, runtime, peer, text) {
+    var body = __cleanText(String(text || "")).trim();
+    if (!body) return false;
+    // [fix] 指纹必须带上「本轮用户消息 ID」。只用正文的话，用户两次发同一句话、
+    // AI 两次回同样内容（比如都回「好」），第二条会被判成已发而永远发不出去。
+    // 带上 turnKey 后：同一轮内正常路径与补偿算出的指纹一致（能去重），
+    // 不同轮即使正文一样，指纹也不同（不会误杀）。
+    var turnKey = String((peer && peer.msgId) || "");
+    var h = __hashText(body + "|" + turnKey);
+    var led = await __sentLoad();
+    var prev = String((led[name] && led[name].lastHash) || "");
+    if (prev && prev === h) {
+        await rlog("DEDUP_SKIP " + name + " len=" + body.length);
+        return true;          // 已经发过同内容，视为成功，不再重复发
+    }
+    await __sentMarkHash(name, h, body.length);   // 先预占，再发
+    var ok = false;
+    try {
+        if (channel === "qq") {
+            if (!runtime || !runtime.appId) throw new Error("no qq runtime");
+            var tk = await qqTokenOf(runtime);
+            var scene = (peer && peer.scene) || "c2c";
+            var to = scene === "c2c" ? String((peer && peer.from) || "") : String((peer && peer.group) || "");
+            if (!to) throw new Error("no peer");
+            var apiPath = scene === "c2c"
+                ? ("/v2/users/" + encodeURIComponent(to) + "/messages")
+                : ("/v2/groups/" + encodeURIComponent(to) + "/messages");
+            var parts = __splitLong(body, QQ_TEXT_LIMIT);
+            if (parts.length > 1) await rlog("QQ_SPLIT " + name + " parts=" + parts.length + " len=" + body.length);
+            for (var i = 0; i < parts.length; i++) {
+                if (i) await sleep(300);
+                // [fix] 普通回复必须带 msg_id 走「被动回复」，否则可能被判为主动消息拒收；
+                // 启动补偿时那个 msg_id 早已过期，所以只在有新鲜 msgId 时才带。
+                var _payload = { content: parts[i], msg_type: 0, msg_seq: i + 1 };
+                var _useMsgId = !(peer && peer.fresh === false);
+                if (peer && peer.msgId && _useMsgId) _payload.msg_id = peer.msgId;
+                await qqHttp("POST", "https://api.sgroup.qq.com" + apiPath, tk, _payload);
+            }
+            ok = true;
+        } else if (channel === "wechat") {
+            if (!runtime) throw new Error("no wx runtime");
+            var f2 = String((peer && peer.from) || "");
+            if (!f2) throw new Error("no peer");
+            await wxReply(runtime, f2, String((peer && peer.ctx) || ""), body);
+            ok = true;
+        }
+    } catch (e) {
+        // 发送失败要把预占撤掉，否则这条永远不会再补
+        try {
+            var d2 = await __sentLoad();
+            if (d2[name] && String(d2[name].lastHash || "") === h) { d2[name].lastHash = ""; await writeJson(SENT_PATH, d2); }
+        } catch (e2) { }
+        await rlog("DELIVER_ERR " + name + " " + errText(e));
+        throw e;
+    }
+    return ok;
+}
+
+// [cleanup] 原来这里还有一套 __deliverText，和 __deliverOnce 重复（也不带去重预占）。
+// 两套发送实现并存迟早改错一边，已删除，统一走 __deliverOnce。
+// [fix] 补偿扫描原本没有「时间基准」：启动时看到最后一条 AI 正文就当成未送达发出去，
+// 于是把好几天前的旧回复又发了一遍（用户收到「古早消息」就是这个原因）。
+// 这里在 restore 时记下每个对话当前的消息条数作为基线，只补「基线之后新增」的消息。
+var __sweepBase = {};
+async function __sweepCaptureBase() {
+    try {
+        for (var i = 0; i < state.accounts.length; i++) {
+            var a = state.accounts[i] || {};
+            var cfg = a.cfg || {};
+            var name = cfg.name || "";
+            var ch = cfg.channel || "wechat";
+            if (ch !== "qq" && ch !== "wechat") continue;
+            var chatId = (state.chatFix && state.chatFix[name]) || (a.runtime && a.runtime.chatId) || cfg.chatId || "";
+            if (!chatId) continue;
+            try {
+                var r0 = await Tools.Chat.getMessages(chatId, { order: "asc" });
+                __sweepBase[name] = ((r0 && r0.messages) || []).length;
+            } catch (e0) { }
+        }
+    } catch (e) { }
+}
+
+async function __sweepOne(acc, gen) {
+    try {
+        var cfg = (acc && acc.cfg) || {};
+        var name = cfg.name || "";
+        var ch = cfg.channel || "wechat";
+        if (ch !== "qq" && ch !== "wechat") return;
+        var rt = acc.runtime;
+        if (!rt) return;
+        var chatId = (state.chatFix && state.chatFix[name]) || rt.chatId || cfg.chatId || "";
+        if (!chatId) return;
+        var r = await Tools.Chat.getMessages(chatId, { order: "asc" });
+        var arr = (r && r.messages) || [];
+        var aiIdx = -1, aiTs = 0, aiTxt = "";
+        for (var i = arr.length - 1; i >= 0; i--) {
+            var m = arr[i] || {};
+            var sd = String(m.sender || "");
+            if (sd === "ai" || sd === "assistant") {
+                aiIdx = i; aiTs = __tsMs(m.timestamp); aiTxt = String(m.content || "").trim();
+                break;
+            }
+            if (sd === "user") break;   // 最后一条是用户消息 => 这轮根本没生成正文
+        }
+        if (aiIdx < 0 || !aiTxt) return;
+        // [fix] 只补「本次启动之后新增」的消息。基线没拿到就整轮跳过（宁可不补，也不发旧消息）。
+        var _base = __sweepBase[name];
+        if (_base === undefined || _base === null) { await rlog("SWEEP_NOBASE " + name); return; }
+        if (aiIdx < Number(_base)) { return; }
+        // [fix] 扫描时若这一轮还在生成，库里的正文可能只写了一半，
+        // 直接发出去就是半截话。先确认平台不忙再补发。
+        // [fix] 启动那一刻如果这一轮还在生成，直接跳过就永久错过了。
+        // 改成耐心等它空下来（最多约 2 分钟），整体仍然只算「这一次启动检查」。
+        var _waitN = 0;
+        while (_waitN < 24) {
+            var stS = null;
+            try { stS = await Tools.Chat.agentStatus(chatId); } catch (eSB) { return; }
+            if (!__isBusy(stS)) break;
+            if (_waitN === 0) await rlog("SWEEP_BUSY_WAIT " + name);
+            await sleep(5000);
+            _waitN++;
+        }
+        if (_waitN >= 24) { await rlog("SWEEP_BUSY_GIVEUP " + name); return; }
+        var led = await __sentLoad();
+        var _peerForHash = await readJsonSafe(HUB + "accounts/" + name + "/last_peer.json", {});
+        var _turnKey = String((_peerForHash && _peerForHash.msgId) || "");
+        var _h = __hashText(aiTxt + "|" + _turnKey);
+        var prevH = String((led[name] && led[name].lastHash) || "");
+        if (prevH && prevH === _h) return;                 // 同一轮同一内容 = 已经发过
+        await rlog("SWEEP_SEND " + name + " ch=" + ch + " len=" + aiTxt.length + " mode=" + (prevH ? "diff" : "first"));
+        var peer = _peerForHash || {};
+        try {
+            // 补偿是「过了一段时间才补发」，msg_id 已过期不能带给 QQ，
+            // 但要留着算指纹（和正常路径对齐），所以用 fresh=false 标记。
+            if (peer) peer.fresh = false;
+            var ok = await __deliverOnce(name, ch, rt, peer, aiTxt);
+            await rlog(ok ? ("SWEEP_OK " + name) : ("SWEEP_FAIL " + name));
+        } catch (e) { await rlog("SWEEP_FAIL " + name + " " + errText(e)); }
+    } catch (e) { await rlog("SWEEP_ERR " + errText(e)); }
+}
+// [fix] 入站补偿：用户消息已经到了（last_peer 里有原文），但对话里最后一条还是
+// 用户消息、且这条根本没被成功处理（seen 里没有），说明插件在处理前就挂了。
+// 这里把这条重新注入一次，让模型补上回复。
+// 去重靠两点：① seen 里有记录就直接跳过；② 只认「启动基线之后」的那条。
+async function __sweepInbound(acc, gen) {
+    try {
+        var cfg = (acc && acc.cfg) || {};
+        var name = cfg.name || "";
+        var ch = cfg.channel || "wechat";
+        if (ch !== "qq" && ch !== "wechat") return;
+        var rt = acc.runtime;
+        if (!rt) return;
+        var chatId = (state.chatFix && state.chatFix[name]) || rt.chatId || cfg.chatId || "";
+        if (!chatId) return;
+        var peer = await readJsonSafe(HUB + "accounts/" + name + "/last_peer.json", {});
+        var pid = String((peer && peer.msgId) || "");
+        var ptext = String((peer && peer.text) || "");
+        if (!pid || !ptext) return;
+        var key = name + "|" + pid;
+        if (state.seen.indexOf(key) >= 0) { return; }        // 处理过（或已判定为空），不重复
+        var r = await Tools.Chat.getMessages(chatId, { order: "asc" });
+        var arr = (r && r.messages) || [];
+        if (!arr.length) return;
+        var lastIdx = arr.length - 1;
+        var last = arr[lastIdx] || {};
+        if (String(last.sender || "") !== "user") return;    // 最后一条不是用户消息，说明回复已在
+        var _base = __sweepBase[name];
+        if (_base === undefined || _base === null) return;
+        if (lastIdx < Number(_base)) return;                 // 启动前就存在的旧消息，不动
+        // 正在生成就不插手
+        try {
+            var stI2 = await Tools.Chat.agentStatus(chatId);
+            if (__isBusy(stI2)) { await rlog("SWEEP_IN_BUSY " + name); return; }
+        } catch (eB2) { return; }
+        await rlog("SWEEP_INBOUND " + name + " msg=" + pid + " len=" + ptext.length);
+        await process(name, ch === "qq" ? "qq" : "wechat", String(peer.from || ""), pid, ptext, chatId, []);
+        await rlog("SWEEP_INBOUND_DONE " + name);
+    } catch (e) { await rlog("SWEEP_IN_ERR " + errText(e)); }
+}
+
+var __sweepRan = false;
+async function __sweepAll(gen) {
+    try {
+        if (!state.running || gen !== state.gen) return;
+        // [fix] 只在插件加载（软件重启）后跑一次，之后完全走正常流程
+        if (__sweepRan) return;
+        __sweepRan = true;
+        for (var i = 0; i < state.accounts.length; i++) {
+            try { await __sweepOne(state.accounts[i], gen); } catch (e) { }
+            try { await __sweepInbound(state.accounts[i], gen); } catch (e2) { }
+        }
+        await rlog("SWEEP_DONE");
+    } catch (e) { await rlog("SWEEP_ALL_ERR " + errText(e)); }
 }
 
 
@@ -290,27 +631,37 @@ function __maybeCleanMedia() {
 function __splitLong(t, limit) {
     if (!t) return [];
     if (t.length <= limit) return [t];
-    var half = Math.ceil(t.length / 2);
-    var cut = -1;
+    // [fix] 原先只切一刀，第二段若还超长就 slice(0, limit) 直接丢掉尾部内容。
+    // 改成循环切分，保证除最后一段外每段都不超限，且不丢字。
+    var out = [];
+    var rest = t;
+    var guard = 0;
     var seps = ["\n\n", "\n", "。", "！", "？", "，", ".", "!", "?", ";"];
-    for (var si = 0; si < seps.length; si++) {
-        var sp = seps[si];
-        var best = -1;
-        var idx = t.indexOf(sp);
-        while (idx >= 0) {
-            var pos = idx + sp.length;
-            if (Math.abs(pos - half) < Math.abs(best - half) || best < 0) best = pos;
-            if (pos > half + 200) break;
-            idx = t.indexOf(sp, idx + 1);
+    while (rest.length > limit && guard < 40) {
+        guard++;
+        var half = Math.ceil(rest.length / 2);
+        var cut = -1;
+        for (var si = 0; si < seps.length; si++) {
+            var sp = seps[si];
+            var best = -1;
+            var idx = rest.indexOf(sp);
+            while (idx >= 0) {
+                var pos = idx + sp.length;
+                if (Math.abs(pos - half) < Math.abs(best - half) || best < 0) best = pos;
+                if (pos > half + 200) break;
+                idx = rest.indexOf(sp, idx + 1);
+            }
+            if (best > 0 && best > limit * 0.3) { cut = best; break; }
         }
-        if (best > 0 && best > limit * 0.3) { cut = best; break; }
+        if (cut <= 0) cut = Math.min(half, limit);
+        var a = rest.slice(0, cut).replace(/\s+$/, "");
+        if (!a) a = rest.slice(0, limit);
+        out.push(a);
+        rest = rest.slice(a.length).replace(/^\s+/, "");
+        if (!rest) break;
     }
-    if (cut <= 0) cut = Math.min(half, limit);
-    var a = t.slice(0, cut).replace(/\s+$/, "");
-    var b = t.slice(cut).replace(/^\s+/, "");
-    if (!b) return [a];
-    if (b.length > limit) b = b.slice(0, limit);
-    return [a, b];
+    if (rest) out.push(rest);
+    return out;
 }
 
 function __cleanText(t) {
@@ -337,10 +688,34 @@ function __pickText(r) {
     return "";
 }
 
+// [fix] 微信有两条独立的拉取通道（Python wxpoll.py 写 wx_inbox.jsonl
+// + JS 的 wxLoopOnce 直接调 getupdates），同一条消息可能被两边同时送进来。
+// 而 state.seen 是「处理成功后」才记，两边会同时通过检查 → 各跑一轮 → 两条回复。
+// 这里加一个「在途」表：一开始处理就占位，后来者直接跳过；占位 5 分钟后自动过期，
+// 失败了还能重来。
+var __inflight = {};
+function __inflightClean() {
+    try {
+        var now = Date.now();
+        for (var k in __inflight) {
+            if (now - Number(__inflight[k] || 0) > 300000) { try { delete __inflight[k]; } catch (e) { } }
+        }
+    } catch (e) { }
+}
+function __inflightTake(key) {
+    if (!key) return true;
+    if (__inflight[key]) return false;
+    __inflight[key] = Date.now();
+    return true;
+}
+
 function enqueue(chatId, task) {
     var prev = chatQueues[chatId] || Promise.resolve();
     var next = prev.then(function () { return task(); }, function () { return task(); });
-    chatQueues[chatId] = next.then(function () {}, function () {});
+    var tail = next.then(function () {}, function () {});
+    chatQueues[chatId] = tail;
+    // [fix] 队列尾巴用完就删掉，否则每个对话都会在 chatQueues 里留一条永不回收的 Promise。
+    tail.then(function () { if (chatQueues[chatId] === tail) { try { delete chatQueues[chatId]; } catch (e) {} } });
     return next;
 }
 
@@ -394,18 +769,21 @@ async function process(name, channel, from, id, text, chatId, atts) {
         }
     }
     if (chatId) {
+        // [fix] 原来最多等 15 秒，仍然忙就直接 return ""，上层把它当成「没拿到回复」，
+        // 这条消息就被丢掉、也永远不会补回。改成「尽量等久，但绝不静默丢弃」：
+        // 最多等 5 分钟；就算还忙也继续往下走 enqueue（宁可晚到，也不要没回）。
         var _stillBusy = false;
         try {
-            for (var _bw = 0; _bw < 6; _bw++) {
+            for (var _bw = 0; _bw < 120; _bw++) {
                 var stb = await Tools.Chat.agentStatus(chatId);
-                var _b = !!(stb && (stb.executing || stb.running || stb.isExecuting));
+                var _b = __isBusy(stb);
                 _stillBusy = _b;
                 if (!_b) break;
-                if (_bw === 5) await rlog("CHAT_BUSY_OBSERVED " + name + " st=" + JSON.stringify(stb || {}).slice(0, 160));
+                if (_bw === 20 || _bw === 60) await rlog("CHAT_BUSY_WAIT " + name + " n=" + _bw + " st=" + JSON.stringify(stb || {}).slice(0, 120));
                 await sleep(2500);
             }
         } catch (e) { }
-        if (_stillBusy) { await rlog("CHAT_BUSY " + name + " " + chatId); return ""; }
+        if (_stillBusy) await rlog("CHAT_BUSY_PROCEED " + name + " " + chatId);
     }
     if (!chatId) {
         try {
@@ -473,7 +851,17 @@ async function wxPost(a, path, body, rt) {
     if (!r || r.statusCode < 200 || r.statusCode >= 300) throw new Error("HTTP " + (r && r.statusCode) + ": " + String(r && r.content).slice(0, 160));
     return JSON.parse(r.content);
 }
-function pickText(m) { try { var it = (m.item_list || [])[0]; if (it && it.text_item && it.text_item.text) return it.text_item.text; } catch (e) {} return m.text || m.content || ""; }
+function pickText(m) {
+    // [fix] 原先只读 item_list[0]，文本若在第二个及以后的 item 里就取不到，会被当成无正文。
+    try {
+        var il = m.item_list || [];
+        for (var i = 0; i < il.length; i++) {
+            var it = il[i];
+            if (it && it.text_item && typeof it.text_item.text === "string" && it.text_item.text) return it.text_item.text;
+        }
+    } catch (e) { }
+    return m.text || m.content || "";
+}
 function pickId(m) { if (m.msg_id) return m.msg_id; try { var it = (m.item_list || [])[0]; if (it && it.msg_id) return it.msg_id; } catch (e) {} return String(m.message_id || ""); }
 
 var __typingCache = {};
@@ -669,6 +1057,8 @@ async function wxHandle(a, gen, m) {
     }
     var key = a.name + "|" + id;
     if (state.seen.indexOf(key) >= 0) return;
+    __inflightClean();
+    if (!__inflightTake(key)) { await rlog("DUP_INFLIGHT " + a.name + " " + id); return; }
     state.received++;
     await rlog("RECV [" + (a.cfg && a.cfg.channel) + "] " + a.name + " " + from + ": " + String(text).slice(0, 500));
     try { pushEvent(a.name, id, from, text); } catch (e0) {}
@@ -700,27 +1090,34 @@ async function wxHandle(a, gen, m) {
         }).join(String.fromCharCode(10)).trim();
         text = _clean ? (_clean + " " + _wxTags.join(" ")) : _wxTags.join(" ");
     }
+    try { await __peerSave(a.name, { from: from, ctx: (m && m.context_token) || "", msgId: id, at: Date.now(), text: String(text || "").slice(0, 4000) }); } catch (eP) { }
     var acc = await process(a.name, _isHttp ? "http" : "wechat", from, id, text, (state.chatFix && state.chatFix[a.name]) || a.chatId, []);
     if (acc === "__EMPTY__") { state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen(); if (!_isHttp) { void wxTypingStop(a, from); } return; }
     if (!acc) {
         if (!_isHttp) { void wxTypingStop(a, from); }
-        state.retryN = state.retryN || {};
-        var rn = (state.retryN[key] || 0) + 1;
-        state.retryN[key] = rn;
-        if (rn <= 2 && state.retry.length < 50) {
-            state.retry.push({ acc: a, gen: gen, m: m, at: Date.now() });
-            await rlog("REQUEUE " + a.name + " " + id + " try=" + rn);
+        // [fix] 原来失败会 push 到 state.retry 里重新走 wxHandle，等于把同一条消息
+        // 再注入一遍：对话里出现两条一样的用户气泡，还会抢占上一轮；
+        // 而且这个队列只被 wxLoopOnce 消费，没开微信账号时永远不排空。
+        // 现在改为只从对话里取回已经生成的正文，取不到就落 seen 丢弃。
+        var _cid = (state.chatFix && state.chatFix[a.name]) || a.chatId;
+        acc = await __recoverReply(_cid, 3);
+        if (acc) {
+            await rlog("RECOVER " + a.name + " " + id + " len=" + acc.length);
+        } else {
+            state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen();
+            if (state.retryN && state.retryN[key]) delete state.retryN[key];
+            await rlog("DROP " + a.name + " " + id);
             return;
         }
-        state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen();
-        await rlog("DROP " + a.name + " " + id + " try=" + rn);
-        return;
     }
+    // [fix] 必须先判代次再落 seen。原来顺序反了：插件重启（gen 变了）时这一轮作废，
+    // 但 key 已经写进 seen，于是这条消息被当成「已处理」，补偿也不会再看它，
+    // 回复就永远发不出去了 —— 这正是「重启后这条没回音」的成因之一。
+    if (gen !== state.gen) { if (!_isHttp) { void wxTypingStop(a, from); } return; }
     state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen();
     if (state.retryN && state.retryN[key]) delete state.retryN[key];
-    if (gen !== state.gen) { if (!_isHttp) { void wxTypingStop(a, from); } return; }
     if (!_isHttp) { await wxTypingStop(a, from); }
-    try { await wxReply(a, from, _isHttp ? id : (m.context_token || ""), acc); }
+    try { await __deliverOnce(a.name, "wechat", a, { from: from, ctx: (_isHttp ? id : (m.context_token || "")) }, acc); }
     catch (e) { await rlog("SEND_ERR " + a.name + " " + errText(e)); }
 }
 
@@ -999,6 +1396,8 @@ async function qqMessage(a, gen, type, body) {
     }
     var key = a.name + "|" + id;
     if (state.seen.indexOf(key) >= 0) return;
+    __inflightClean();
+    if (!__inflightTake(key)) { await rlog("QQ_DUP_INFLIGHT " + a.name + " " + id); return; }
     state.received++;
     await rlog("QQ_RECV " + a.name + " " + id + " from=" + from + " len=" + text.length);
     __maybeCleanMedia();
@@ -1016,36 +1415,34 @@ async function qqMessage(a, gen, type, body) {
         }).join(String.fromCharCode(10)).trim();
         text = _clean2 ? (_clean2 + " " + _qqTags.join(" ")) : _qqTags.join(" ");
     }
+    // 记住最近一次对端信息：重启后补偿发送时要用它决定往哪发
+    try { await __peerSave(a.name, { scene: scene, from: from, group: groupOpenid, msgId: id, at: Date.now(), text: String(text || "").slice(0, 4000) }); } catch (eP) { }
     var acc = await process(a.name, "qq", from, id, text, (state.chatFix && state.chatFix[a.name]) || a.chatId, []);
-    // [fix] QQ 通道原先失败后只记 QQ_REQUEUE 就结束，state.retry 仅由 wxLoopOnce 消费，
-    // 而 wxLoopOnce 受 a.running 门控、QQ 根本没有这条驱动，因此重试永远不会发生。
-    // 这里改为就地有限重试（最多 2 次，间隔 2s），与微信侧重试次数一致。
+    // [fix] 原实现失败后有两种毛病：一是根本不重试（QQ_REQUEUE 后直接 return），
+    // 二是后来改成就地重试 = 把同一条消息再注入一次，会产生重复的用户气泡并抢占上一轮；
+    // 而且最终失败时没有落 seen，网关重投或插件重启后同一条消息会被反复处理。
+    // 现在：只从对话里取回已生成的正文；确实取不到就落 seen 丢弃。
     if (!acc) {
-        for (var _qqr = 1; _qqr <= 2 && !acc; _qqr++) {
-            await rlog("QQ_RETRY " + a.name + " " + id + " try=" + _qqr);
-            await sleep(2000);
-            if (!(state.running && a.running && gen === state.gen)) break;
-            try {
-                acc = await process(a.name, "qq", from, id, text, (state.chatFix && state.chatFix[a.name]) || a.chatId, []);
-            } catch (eR2) { await rlog("QQ_RETRY_ERR " + a.name + " " + errText(eR2)); }
+        var _qcid = (state.chatFix && state.chatFix[a.name]) || a.chatId;
+        acc = await __recoverReply(_qcid, 3);
+        if (acc) {
+            await rlog("QQ_RECOVER " + a.name + " " + id + " len=" + acc.length);
+        } else {
+            state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen();
+            await rlog("QQ_DROP " + a.name + " " + id);
+            return;
         }
     }
     if (acc === "__EMPTY__") { state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen(); return; }
-    if (!acc) { await rlog("QQ_REQUEUE " + a.name + " " + id); return; }
+    // [cleanup] 原来的 `if (!acc) QQ_REQUEUE` 永远走不到（上面已处理 !acc），已删除
     state.seen.push(key); if (state.seen.length > 1024) state.seen.shift(); void saveSeen();
     state.replied++;
     try {
-        var tok = await qqTokenOf(a);
-        var path = scene === "c2c" ? ("/v2/users/" + encodeURIComponent(from) + "/messages") : ("/v2/groups/" + encodeURIComponent(groupOpenid) + "/messages");
         var _qtxt = __cleanText(acc);
         if (!_qtxt) { await rlog("REPLY_EMPTY " + a.name); return; }
-        var _qparts = __splitLong(_qtxt, QQ_TEXT_LIMIT);
-        if (_qparts.length > 1) { await rlog("QQ_SPLIT " + a.name + " parts=" + _qparts.length + " len=" + _qtxt.length); }
-        for (var qi = 0; qi < _qparts.length; qi++) {
-            if (qi > 0) { await sleep(300); }
-            var res = await qqHttp("POST", "https://api.sgroup.qq.com" + path, tok, { content: _qparts[qi], msg_type: 0, msg_id: id });
-            await rlog("QQ_REPLY " + a.name + " " + id + " " + JSON.stringify(res || {}).slice(0, 80));
-        }
+        // 走统一出口：和启动补偿共用一次预占，避免同一内容被发两遍
+        await __deliverOnce(a.name, "qq", a, { scene: scene, from: from, group: groupOpenid, msgId: id }, _qtxt);
+        await rlog("QQ_REPLY " + a.name + " " + id + " len=" + _qtxt.length);
     } catch (e) { await rlog("QQ_REPLY_ERR " + a.name + " " + errText(e)); }
 }
 
@@ -1077,6 +1474,19 @@ var __inboxOff = 0;
 var __wxPollStarted = false;
 async function ensureWxPoll() {
     if (__wxPollStarted) return;
+    // [fix] 原来 Python 的 wxpoll.py 和 JS 的 wxLoopOnce 同时在拉同一批消息：
+    // 两条通道各有自己的游标，同一条消息会被各送一次。inflight 去重只是兜底，
+    // 白耗请求、放大竞态。现在只保留 JS 轮询，启动时把可能还在跑的 wxpoll 杀掉。
+    __wxPollStarted = true;
+    try {
+        await __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && if [ -f wxpoll.pid ] && kill -0 $(cat wxpoll.pid) 2>/dev/null; then kill $(cat wxpoll.pid) 2>/dev/null; fi; rm -f wxpoll.pid; rm -f wx_inbox.jsonl");
+        __inboxOff = 0;
+        await rlog("WXPOLL_DISABLED js_poller_only");
+    } catch (eWp) { await rlog("WXPOLL_OFF_ERR " + errText(eWp)); }
+}
+
+async function __ensureWxPollLegacy() {
+    if (__wxPollStarted) return;
     try {
         var list = [];
         for (var i = 0; i < (state.accounts || []).length; i++) {
@@ -1097,13 +1507,23 @@ async function ensureWxPoll() {
 }
 async function wxInboxTick() {
     try {
+        // [fix] Python 轮询已停用，收件箱不会再增长；这里直接返回，省掉每 800ms 读文件
+        return;
+        // [fix] 未启动时不要处理收件箱，避免插件停止后还在往里灌消息
+        if (!state.running) return;
         var txt = await readFile(WX_INBOX);
         if (!txt) return;
         if (txt.length < __inboxOff) __inboxOff = 0;
         if (txt.length <= __inboxOff) return;
         var chunk = txt.slice(__inboxOff);
-        __inboxOff = txt.length;
-        var lines = chunk.split(String.fromCharCode(10));
+        // [fix] 只消费到最后一个完整换行：原先直接把 __inboxOff 推到文件末尾，
+        // 如果最后一行是 Python 刚写了一半的 JSON，parse 失败就 continue，
+        // 而偏移已经越过它，这条消息会永久丢失。
+        var nl = chunk.lastIndexOf(String.fromCharCode(10));
+        if (nl < 0) return;
+        var usable = chunk.slice(0, nl + 1);
+        __inboxOff += usable.length;
+        var lines = usable.split(String.fromCharCode(10));
         for (var li = 0; li < lines.length; li++) {
             var ln = lines[li].trim();
             if (!ln) continue;
@@ -1192,7 +1612,12 @@ async function restore() {
     try { ensureIpc(); } catch (eIr) { }
     try {
         if (state.running) return;
-        var cfg = state.cfgOverride ? state.cfgOverride : normalize(await loadJson(CFG_PATH, DEFAULT_CFG));
+        // [fix] 以配置文件为准。原来优先用内存里的 cfgOverride，
+        // 于是手改 rt_config.json 之后必须重启 App 才会生效。
+        // 只有 startWith 显式传进来的配置优先，用完即清标记。
+        var _fileCfg = normalize(await loadJson(CFG_PATH, DEFAULT_CFG));
+        var cfg = (state.cfgOverrideStartWith && state.cfgOverride) ? state.cfgOverride : _fileCfg;
+        state.cfgOverrideStartWith = false;
         state.cfgOverride = cfg; state.cfg = cfg;
         state.running = true; state.gen++;
         var gen = state.gen;
@@ -1219,18 +1644,31 @@ async function restore() {
                 else await rlog("CH_UNSUPPORTED " + (acc.cfg.name || "?") + " channel=" + ch);
             } catch (e) { await rlog("ACC_ERR " + (acc.cfg && acc.cfg.name) + " " + errText(e)); }
         }
+        // [fix] 先记录基线（此刻已有多少条消息），之后只补基线之后新增的，
+        // 避免把历史回复当成「未送达」重发一遍。
+        try { await __sweepCaptureBase(); } catch (eBS) { }
+        // [fix] 启动后延迟几秒做一次补发扫描：上次若在「正文已生成、还没送出去」
+        // 的时候被重启，这里会把它补发到 QQ/微信。
+        try {
+            setTimeout(function () { void __sweepAll(gen); }, 6000);
+        } catch (eSw) { }
     } catch (e) { await rlog("RESTORE_ERR " + errText(e)); }
 }
 
 function stop(killGateway) {
     state.running = false; state.gen++;
+    var _stopNames = [];
     for (var i = 0; i < state.accounts.length; i++) {
         var a = state.accounts[i];
         if (a.runtime) a.runtime.running = false;
+        if (a.cfg && a.cfg.name) _stopNames.push(a.cfg.name);
     }
     state.accounts = [];
+    // [fix] 停止时把 run 标记清零，否则状态页会显示「运行中」最长 5 分钟
+    if (_stopNames.length) { try { void markRunClear(_stopNames); } catch (eRc) { } }
     if (killGateway) { __wxPollStarted = false; try { void __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && if [ -f wxpoll.pid ] && kill -0 $(cat wxpoll.pid) 2>/dev/null; then kill $(cat wxpoll.pid) 2>/dev/null; fi; rm -f wxpoll.pid"); } catch (eKw) { } try { void __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && if [ -f gw.pid ] && kill -0 $(cat gw.pid) 2>/dev/null; then kill $(cat gw.pid) 2>/dev/null; fi; rm -f gw.pid"); } catch (e) {} }
     void rlog("STOP");
+    try { void __flushLog(); } catch (eF) { }
 }
 
 
@@ -1455,6 +1893,14 @@ async function firstWechatAccount() {
 
 var RUN_PATH = HUB + "run_state.json";
 var __runQ = Promise.resolve();
+async function markRunClear(names) {
+    try {
+        if (!names || !names.length) return;
+        var tbl = await readJsonSafe(RUN_PATH, {});
+        for (var i = 0; i < names.length; i++) tbl[names[i]] = 0;
+        await writeJson(RUN_PATH, tbl);
+    } catch (e) { }
+}
 function markRun(name, on) {
     __runQ = __runQ.then(async function () {
         try {
@@ -1476,7 +1922,7 @@ async function softDelete(name, type, extra) {
     var moved = false;
     try { await Tools.Files.move(HUB + "accounts/" + name, TRASH_DIR + dir); moved = true; }
     catch (eM) {
-        try { await __termExec("mv /storage/emulated/0/Download/Operit/bridge_hub/accounts/" + name + " /storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + dir); moved = true; } catch (e2) {}
+        try { await __termExec("mv " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/" + name) + " " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + dir)); moved = true; } catch (e2) {}
     }
     if (!moved) return false;
     var arr = await trashLoad();
@@ -1539,7 +1985,7 @@ async function handleTool(name, p) {
                     }
                 }
                 try { await Tools.Files.move(TRASH_DIR + rec.dir, HUB + "accounts/" + target); } catch (eR) {
-                    try { await __termExec("mv /storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + rec.dir + " /storage/emulated/0/Download/Operit/bridge_hub/accounts/" + target); } catch (eR2) { continue; }
+                    try { await __termExec("mv " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + rec.dir) + " " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/" + target)); } catch (eR2) { continue; }
                 }
                 try {
                     var aj9 = await readJsonSafe(HUB + "accounts/" + target + "/account.json", {});
@@ -1566,7 +2012,15 @@ async function handleTool(name, p) {
                 var r2 = tb[tj];
                 if (dirs2.indexOf(r2.dir) < 0) { left.push(r2); continue; }
                 var full = "/storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + r2.dir;
-                try { await Tools.Files.deleteFile(full); } catch (e1) { try { await Tools.Files.delete(full); } catch (e2) { void __termExec("rm -rf " + full); } }
+                // [fix] 删除失败也把记录从索引里删掉，会留下永远看不到、也删不掉的孤儿目录
+                var _delOk = false;
+                try { await Tools.Files.deleteFile(full); _delOk = true; } catch (e1) {
+                    try { await Tools.Files.delete(full); _delOk = true; } catch (e2) {
+                        try { await __termExec("rm -rf " + shq(full)); } catch (e3) { }
+                    }
+                }
+                try { var _still = await Tools.Files.exists(full); _delOk = !_still; } catch (e4) { }
+                if (!_delOk) { left.push(r2); continue; }
                 gone.push(r2.name);
             }
             await trashSave(left);
@@ -1575,6 +2029,8 @@ async function handleTool(name, p) {
         if (short === "bridge_log") {
             var actL = String(p.action || "");
             if (actL === "clear") {
+                // [fix] 先清缓冲再写文件，否则清完 800ms 内旧缓冲又会被刷回去
+                try { __logBuf = []; __logBytes = 0; } catch (eB) { }
                 try { await writeFile(HUB + "rt.log", ""); } catch (eL) { }
                 state.logLines = [];
                 return { success: true, cleared: true };
@@ -1628,7 +2084,15 @@ async function handleTool(name, p) {
                 var ix3 = await indexList();
                 for (var q = 0; q < ix3.length; q++) if (ix3[q] === nm) ix3[q] = nn;
                 await setIndex(ix3);
-                try { void __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub/accounts && mv " + nm + " " + nn); } catch (e) {}
+                // [fix] 原先用 void 异步发出去就继续改配置，mv 失败（目标已存在、权限等）
+                // 会导致配置指向新名字、目录还在旧名字，账号直接失联。
+                // 这里改为等它执行完并核对目录是否真的移过去了。
+                var _mvOk = false;
+                try {
+                    await __termExec("cd /sdcard/Download/Operit/bridge_hub/accounts && mv " + shq(nm) + " " + shq(nn));
+                    try { _mvOk = await Tools.Files.exists(HUB + "accounts/" + nn); } catch (eX) { _mvOk = false; }
+                } catch (e) { _mvOk = false; }
+                if (!_mvOk) return { success: false, error: "重命名失败：目录没有移动成功" };
                 var ce0 = await cfgOf(nm);
                 var keep = { channel: (ce0 && ce0.channel) || "wechat", enabled: !(ce0 && ce0.enabled === false) };
                 if (ce0 && ce0.chatId) keep.chatId = ce0.chatId;
@@ -1747,6 +2211,9 @@ async function handleTool(name, p) {
             for (var i3 = 0; i3 < state.accounts.length; i3++) {
                 var a3 = state.accounts[i3];
                 if (!a3 || !a3.runtime || !a3.runtime.running) continue;
+                // [fix] QQ 通道走 WebSocket，没有 getupdates 轮询；拿它的 runtime
+                // 去调 wxLoopOnce 会报 URL 无效，并可能把 QQ 消息当微信消息处理。
+                if (a3.cfg && a3.cfg.channel === "qq") continue;
                 try { await wxLoopOnce(a3.runtime, state.gen); done.push(a3.cfg.name); } catch (e) {}
             }
             return { success: true, pumped: done, injected: [], nextMsgId: 0, skipped: [] };
@@ -1783,14 +2250,6 @@ async function handleTool(name, p) {
                 try { _o.sendMsg = String(Tools.Chat.sendMessage).slice(0,200); } catch(e){}
                 return { success: true, api2: _o };
             }
-            if (p.mode === "api2") {
-                var _o = {};
-                try { _o.copy = String(Tools.Files.copy).slice(0,200); } catch(e){ _o.copyErr = errText(e); }
-                try { _o.cfgDir = ToolPkg.getConfigDir(); } catch(e){ _o.cfgErr = errText(e); }
-                try { _o.dataDir = ToolPkg.getLocalDataDir(); } catch(e){ _o.dataErr = errText(e); }
-                try { _o.sendMsg = String(Tools.Chat.sendMessage).slice(0,200); } catch(e){}
-                return { success: true, api2: _o };
-            }
             if (p.mode === "api") {
                 var _out = {};
                 try {
@@ -1801,30 +2260,6 @@ async function handleTool(name, p) {
                 } catch (eA) { _out.err = errText(eA); }
                 try { _out.toolpkg = Object.keys(typeof ToolPkg !== "undefined" ? ToolPkg : {}); } catch (eB) { }
                 return { success: true, api: _out };
-            }
-            if (p.mode === "api") {
-                var _out = {};
-                try {
-                    _out.tools = Object.keys(typeof Tools !== "undefined" ? Tools : {});
-                    if (Tools && Tools.Chat) _out.chat = Object.keys(Tools.Chat);
-                    if (Tools && Tools.Files) _out.files = Object.keys(Tools.Files);
-                    if (Tools && Tools.Input) _out.input = Object.keys(Tools.Input);
-                } catch (eA) { _out.err = errText(eA); }
-                try { _out.toolpkg = Object.keys(typeof ToolPkg !== "undefined" ? ToolPkg : {}); } catch (eB) { }
-                return { success: true, api: _out };
-            }
-            if (p.mode === "vision") {
-                var _vp = String(p.attach);
-                var _v = {};
-                try {
-                    var _b = await Tools.Files.readBinary(_vp);
-                    _v.type = typeof _b;
-                    var _s = (typeof _b === "string") ? _b : ((_b && (_b.base64 || _b.data || _b.content)) || "");
-                    _v.len = String(_s).length;
-                    _v.head = String(_s).slice(0, 40);
-                    _v.vkeys = Object.keys(_b || {}).slice(0, 10);
-                } catch (eV) { _v.err = errText(eV); }
-                return { success: true, vision: _v };
             }
             if (p.mode === "vision") {
                 var _vp = String(p.attach);
@@ -1925,6 +2360,7 @@ async function handleRequest(req) {
             return { success: true, status: await statusSnapshot() };
         }
         if (action === "startWith") {
+            state.cfgOverrideStartWith = true;
             state.cfgOverride = req.config || state.cfgOverride;
             state.seeds = req.seeds || {};
             stop();
@@ -1977,11 +2413,8 @@ function __wxTick(a, gen) {
 }
 
 async function wxLoopOnce(a, gen) {
-    for (var ri = 0; ri < 3 && state.retry.length > 0; ri++) {
-        var item = state.retry.shift();
-        if (!item || item.gen !== state.gen) continue;
-        try { await wxHandle(item.acc, item.gen, item.m); } catch (e) {}
-    }
+    // [fix] state.retry 已废弃（重试改为 __recoverReply 取回正文，不再重新注入），
+    // 这里不再排空队列，避免同一批失败消息换条通道再跑一遍。
     try {
         var _pt0 = Date.now();
         var j = await wxPost(a, "/ilink/bot/getupdates", { get_updates_buf: a.syncBuf, base_info: { channel_version: "2.0.0" } }, ((a.cfg && a.cfg.channel === "http") ? 3 : 40));
