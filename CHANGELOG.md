@@ -5,6 +5,32 @@
 
 ---
 
+## 1.4.18-r2：图片 / 文件收发失效（媒体下载进程被误停）
+
+### 现象
+QQ（微信同理）发图片后没有任何回应：对话里收不到图，也收不到任何文字回复，插件侧只在 `rt.log` 留下 `QQ_RAW qq-1 atts=1 types=image/jpeg`，随后 `ASK_EMPTY`。
+
+### 根因
+附件下载走的是 `job_*.json` → `done_*.json` 的文件队列，消费方是 Python `wxpoll.py` 里的 `media_daemon()`。
+为修「重复消息」，1.4.18 在启动时禁用并杀掉了 `wxpoll` 进程（`WXPOLL_DISABLED js_poller_only`），`media_daemon` 随之停止，队列只进不出：
+JS 侧每张图白等 60 秒（240 × 250ms）拿不到 `done_*`，文本变空，整条消息被 `process()` 当空消息丢弃（`ASK_EMPTY`）。
+实证：`media/` 下积压 3 个 job 文件（对应最后三次发图），`done_*` 最新停在 11 月 4 日。
+
+### 修复
+- 新增独立常驻脚本 `media_worker.py`，把媒体下载从轮询进程里剥离出来，轮询仍然禁用（`WXPOLL_DISABLED`），两者互不牵连。
+- `restore()` 启动时无条件拉起媒体守护（不再依赖是否存在微信账号），`ensureWxPoll()` 再兜底调用一次（幂等）。
+- `__qqMedia` / `__wxMedia` 增加失败日志：`QQ_MEDIA_NONE`、`QQ_MEDIA_EMPTY`、`WX_MEDIA_EMPTY`，不再静默超时。
+- QQ 附件全部取不到时补一句占位文本，避免整条消息被当作空消息丢弃。
+
+### 验证
+- 部署后 `rt.log` 出现 `MEDIA_WORKER_UP 7341`，`media.log` 有 `WORKER_UP pid=7341`，进程常驻。
+- 积压的 3 个 `job_*` 全部转为 `MEDIA_OK`（92831 字节），队列清零。
+- 修复前：`QQ_RAW` 之后无 `QQ_MEDIA`，最终 `ASK_EMPTY`；修复后：应出现 `QQ_MEDIA n=1` 并正常回传。
+
+### 发布修正（市场打回）
+市场登记版本为 1.4.18，但发行包内 `manifest.json` 仍是 `1.3.18`，被市场判为版本不一致打回。
+本次重新打包 `bridge_hub-v1.4.18.toolpkg`，包内 `manifest.json` 与主文件 `var VER` 均为 `1.4.18`，并替换 Release 附件。
+
 ## 一、回复「思考完整、但正文为空」
 
 **现象**：带角色卡/工作流的对话里，模型思考过程完整、内容也对得上，但 AI 消息正文为空，数据库里 0 字符、0 token；微信/QQ 收到空消息，对话里留一个空气泡。
