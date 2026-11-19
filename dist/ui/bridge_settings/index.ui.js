@@ -30,6 +30,9 @@ function Screen(ctx) {
     const qrBusyState = useS(ctx, "qrBusy", false);   // 防扫码连点
     const qrWatchState = useS(ctx, "qrWatch", false);
     const revealState = useS(ctx, "reveal", null); // [FIX] 自动轮询开关（原来未声明，导致扫码后自动登录整段失效）
+    // 监听范围切换的确认弹窗：{ name, mode, needKey } 或 { step:"key", name, token }
+    const exposeAskState = useS(ctx, "exposeAsk", null);
+    const gwBusyState = useS(ctx, "gwBusy", null);   // 正在重启网关时的弹窗文案
 
     function tryParse(t) {
         if (typeof t !== "string") return null;
@@ -110,7 +113,12 @@ function Screen(ctx) {
             globalThis.__bridgeUiReported = true;
             var __probe = []; var __names = ["Text","Button","Row","Column","Card","LazyColumn","TextField","Switch","Image","AsyncImage","WebView","Icon","IconButton","OutlinedButton","TextButton","Checkbox","CheckBox","RadioButton","AlertDialog","Dialog","Chip","ListItem","Box","Spacer","Divider","ProgressIndicator"];
             for (var __i = 0; __i < __names.length; __i++) { try { if (typeof ctx.UI[__names[__i]] === "function") __probe.push(__names[__i]); } catch (e) {} }
-            RPC("bridge_core:bridge_ui", { keys: __probe.join(",") + "|tm=" + (typeof setTimeout) + "|cp=" + (typeof (ctx && ctx.copyToClipboard)) });
+            var __cs = "";
+            try {
+                var __cso = (ctx && ctx.MaterialTheme && ctx.MaterialTheme.colorScheme) || null;
+                if (__cso) { var __ks = []; for (var __k in __cso) __ks.push(__k); __cs = __ks.join(","); }
+            } catch (eCS) { __cs = "ERR:" + String(eCS && eCS.message || eCS); }
+            RPC("bridge_core:bridge_ui", { keys: __probe.join(",") + "|tm=" + (typeof setTimeout) + "|cp=" + (typeof (ctx && ctx.copyToClipboard)) + "|cs=" + __cs });
         }
     } catch (eRep) {}
     var __labels = [];
@@ -124,6 +132,65 @@ function Screen(ctx) {
         if (props) { for (var k in props) o[k] = props[k]; }
         o.text = t || o.text || "确定";
         return __RawButton(o);
+    }
+
+    // ── 主题取色 ──
+    // 每次都现读当前 Material3 调色板，不在模块加载时缓存：
+    // 缓存的话用户切深色/换主题色时，这里拿到的还是旧色板，界面不会跟着变。
+    function CS_OF() {
+        try { return (ctx.MaterialTheme && ctx.MaterialTheme.colorScheme) || null; } catch (eCs0) { return null; }
+    }
+    function TOK(name) {
+        try { var c = CS_OF(); if (c && c[name]) return c[name]; } catch (eCs1) { }
+        return name;
+    }
+    // 主题色 + 透明度 = 主题色的浅色。
+    // 注意 copy() 只接受 alpha，over 是 token 自己的属性，得单独赋值，
+    // 让宿主按底色合成出稳定的浅色（否则只是半透明，压在不同底色上深浅不一）。
+    function TOK_TINT(name, alpha) {
+        try {
+            var c = CS_OF(), t = c && c[name];
+            if (t && typeof t.copy === "function") {
+                var d = t.copy({ alpha: alpha });
+                try { if (d) d.over = TOK("surface"); } catch (eOv) { }
+                return d;
+            }
+        } catch (eCs2) { }
+        return TOK(name);
+    }
+
+    // 分段按钮：未选中 = 主题色的浅色底 + 深字；选中 = 主题色深底 + 反白字。
+    // 注意不要用 Button 的 containerColor/contentColor：实测那条路填不出底色，只剩描边。
+    // 改成 Row 自带 background + backgroundShape + onClick，文字颜色显式给，不靠继承。
+    function SEG(isOn, label, onTap, styleName) {
+        var cs = CS_OF() || {};
+        var bgOff = cs.primaryContainer || TOK_TINT("primary", 0.14);
+        var fgOff = cs.onPrimaryContainer || TOK("primary");
+        var txt = {
+            text: label,
+            style: styleName || "labelLarge",
+            textAlign: "center",
+            fillMaxWidth: true,
+            maxLines: 1,
+            color: isOn ? TOK("onPrimary") : fgOff
+        };
+        if (isOn) txt.fontWeight = "bold";
+        try {
+            if (typeof ctx.UI.Row === "function") {
+                return ctx.UI.Row({
+                    weight: 1,
+                    background: isOn ? TOK("primary") : bgOff,
+                    backgroundShape: { cornerRadius: 18 },
+                    paddingVertical: 9,
+                    paddingHorizontal: 4,
+                    onClick: onTap,
+                    content: [__RawText(txt)]
+                });
+            }
+        } catch (eSeg1) { }
+        // 兜底：Row 不支持点击时退回普通按钮，宁可没底色也不能没反应
+        try { return __RawButton({ weight: 1, onClick: onTap, text: label }); } catch (eSeg2) { }
+        return __RawText(txt);
     }
     var __ICON_LABEL = { check: "确认", edit: "编辑", delete: "删除", close: "移除", refresh: "刷新", add: "添加", qr: "二维码", save: "保存", stop: "停止", play: "启动" };
     function IBTN(props) {
@@ -175,7 +242,12 @@ function Screen(ctx) {
             throw e;
         }
     }
-    function TOAST(t) { try { msgState.set(String(t)); } catch (e) {} }
+    function TOAST(t) {
+        const s = String(t || "");
+        // 宿主 toast 浮在最上层，滚动到页面中段也看得见；msgState 只作兜底
+        try { if (ctx && typeof ctx.showToast === "function") { ctx.showToast(s); return; } } catch (eS) { }
+        try { msgState.set(s); } catch (e) {}
+    }
     function SLEEP(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
     const accounts = (statusState.value && statusState.value.accounts) ? statusState.value.accounts : [];
@@ -220,23 +292,24 @@ function Screen(ctx) {
             try { TOAST("已创建 " + name + "，可点击名称直接改"); } catch (_e) {}
         }
     }
-    // [FIX] 旧的“同一个按钮点两次”确认方式不可靠：
-    // 上膛状态存在跨重渲染的 delState 里，切页面/刷新会让渲染快照与真实状态不同步，
-    // 表现就是“图标看起来复位了，但一点就直接删”。
-    // 改为显式确认条：删除图标只负责展开，真正删除只能点确认条里的“确认删除”。
+    // 删除确认：点图标弹窗「确认删除 / 取消」，确定后才真正删。
+    // 不用卡片内联确认条（之前那条只写了「取消」、没有确认按钮，等于删不掉）。
+    // 也不用「同一按钮点两次」：上膛状态寄托在跨重渲染的 delState 上，切页面/刷新后
+    // 快照与真实状态不同步，会出现「图标看着复位了、一点却直接删」。
     function opAskDelete(a) {
         delState.set(a.name);
-        try { TOAST("请点下方「确认删除」才会真正删除"); } catch (_e) {}
     }
     function opCancelDelete() {
         delState.set("");
     }
-    function opDoDelete(a) {
-        // 双保险：必须处于确认态才执行
-        if (delState.value !== a.name) { delState.set(""); return; }
+    function opDoDelete(name) {
+        var n = String(name || "");
         delState.set("");
-        return call("bridge_core:bridge_accounts", { action: "remove", account: a.name }, a.name + " 已删除").then(function () {
-            if (selState.value === a.name) selState.set("");
+        if (!n) return;
+        // 正在看这个账号的详情页就退出去，否则删完还停在一个已经不存在的账号上
+        if (pageState.value === n) pageState.set("");
+        return call("bridge_core:bridge_accounts", { action: "remove", account: n }, n + " 已删除").then(function () {
+            if (selState.value === n) selState.set("");
             return refresh();
         });
     }
@@ -252,7 +325,14 @@ function Screen(ctx) {
     }
 
     function opTokenClear(a) {
-        return call("bridge_core:bridge_token", { account: a.name, clear: true }, "令牌已清除，可自定义").then(refresh);
+        const wasOpen = String(a.expose || "local") !== "local";
+        // 先本地清掉，令牌区/按钮立刻给反馈；没密钥就不能对外，档位同步显示回本机
+        try { setAccLocal(a.name, { tokenReady: false, hasToken: false, tokenFull: "", accessTokenPreview: "", tokenLen: 0, token: "", expose: "local", allowPublic: false }); } catch (eL) { }
+        return call("bridge_core:bridge_token", { account: a.name, clear: true }, "令牌已清除，可自定义").then(function (p) {
+            if (wasOpen) TOAST("密钥已清除，已自动切回仅本机");
+            void watchGw("密钥已清除，网关正在重启…");
+            return p;
+        });
     }
     function opRename(a) {
         const nn = String(ed(a.name).newName || "").trim();
@@ -282,15 +362,170 @@ function Screen(ctx) {
             errState.set("测试异常：" + String(e && e.message ? e.message : e));
         });
     }
-    function opSetExpose(a, mode) {
+    // 切档位：本机/局域网一次点按直接生效（没密钥就顺手生成一个），公网风险最高仍弹确认。
+    function setExposeLocal(name, mode) { setAccLocal(name, { expose: mode, allowPublic: (mode === "public") }); }
+    function setAccLocal(name, patch) {
+        const st = statusState.value;
+        if (!st || !Array.isArray(st.accounts)) return;
+        const nx = Object.assign({}, st);
+        nx.accounts = st.accounts.map(function (x) {
+            return (x.name === name) ? Object.assign({}, x, patch) : x;
+        });
+        statusState.set(nx);
+    }
+    function accByName(name) {
+        const list = (statusState.value && statusState.value.accounts) || [];
+        for (let i = 0; i < list.length; i++) if (list[i].name === name) return list[i];
+        return null;
+    }
+    function uilog(msg) { try { RPC("bridge_core:bridge_uilog", { msg: String(msg) }).catch(function () { }); } catch (e) { } }
+    function opAskExpose(a, mode) {
         const m = String(mode || "local");
-        if (m !== "local" && !a.tokenReady) {
-            errState.set("请先生成访问令牌，再开放局域网或公网访问");
-            try { TOAST("缺少密钥：先点「随机生成」拿一个令牌"); } catch (_e) {}
-            return Promise.resolve(null);
+        uilog("tap expose " + a.name + " want=" + m + " cur=" + String(a.expose || "local"));
+        if (m === String(a.expose || "local")) return Promise.resolve(null);
+        // 公网：把「谁能连上来」说清楚再确认
+        if (m === "public") { exposeAskState.set({ name: a.name, mode: m, needKey: !a.tokenReady }); return Promise.resolve(null); }
+        return doExposeNow(a.name, m);
+    }
+    // 网关重启是后台做的：先看后端有没有排上任务（gwPending）或正在跑（gwApplying），
+    // 有就等它跑完再收弹窗；都没有就直接返回，不多做轮询。
+    async function watchGw(label, quiet) {
+        let p0 = null;
+        try { p0 = parse(await RPC("bridge_core:bridge_status", {})); } catch (e0) { p0 = null; }
+        if (!p0 || (!p0.gwApplying && !p0.gwPending)) { if (p0 && p0.accounts) statusState.set(p0); return; }
+        let started = !!p0.gwApplying;
+        for (let i = 0; i < 10 && !started; i++) {
+            await delay(200);
+            let p = null;
+            try { p = parse(await RPC("bridge_core:bridge_status", {})); } catch (e1) { p = null; }
+            if (!p) continue;
+            if (p.accounts) statusState.set(p);
+            if (p.gwApplying) started = true;
+            if (!p.gwApplying && !p.gwPending) break;   // 任务已经跑完了
         }
-        const txt = m === "local" ? "已改为仅本机访问" : (m === "lan" ? "已允许局域网访问（需密钥）" : "已允许公网访问（需密钥）");
-        return call("bridge_core:bridge_config", { account: a.name, config: JSON.stringify({ expose: m }) }, txt).then(refresh);
+        if (!started) return;
+        gwBusyState.set(String(label || "正在重启网关，稍等一下…"));
+        let finished = false;
+        for (let i = 0; i < 24; i++) {
+            await delay(300);
+            let p = null;
+            try { p = parse(await RPC("bridge_core:bridge_status", {})); } catch (e1) { p = null; }
+            if (!p) continue;
+            if (p.accounts) statusState.set(p);
+            if (!p.gwApplying) { finished = true; break; }
+        }
+        gwBusyState.set(null);
+        if (!quiet) TOAST(finished ? "网关已重启" : "重启比平时慢，稍后到状态里确认一下");
+    }
+    // 真正下发配置。本机/局域网直接走这里，公网由弹窗确认后也走这里。
+    async function doExposeNow(name, mode, tokenIn) {
+        let token = String(tokenIn || "");
+        if (!token) {
+            const acc = accByName(name);
+            if (acc && !acc.tokenReady) {
+                const p = await call("bridge_core:bridge_token", { account: name }, null);
+                token = String((p && p.token) || "");
+                if (!token) { errState.set("生成访问令牌失败，请重试"); return; }
+            }
+        }
+        setExposeLocal(name, mode);   // 先让界面立刻跟着动，不用等重启完
+        const txt = mode === "lan" ? "已切到局域网" : (mode === "public" ? "已切到公网" : "已切到仅本机");
+        const r = await call("bridge_core:bridge_config", { account: name, config: JSON.stringify({ expose: mode }) }, txt);
+        uilog("expose applied " + name + " " + mode + " ok=" + !!r);
+        if (!r) { await refresh(); return; }
+        await refresh();
+        if (token) {
+            // 先等网关重启走完，再弹「已生成访问令牌」；两个弹窗同时出来会互相盖住
+            await watchGw("正在切换监听范围，网关重启中…", true);
+            exposeAskState.set({ step: "key", name: name, token: token, mode: mode });
+        } else {
+            void watchGw("正在切换监听范围，网关重启中…");
+            TOAST(txt);
+        }
+    }
+    async function doExpose() {
+        const s = exposeAskState.value;
+        if (!s) return;
+        exposeAskState.set(null);
+        await doExposeNow(s.name, s.mode, "");
+    }
+    function exposeDialog() {
+        const s = exposeAskState.value;
+        if (!s) return null;
+        if (s.step === "key") {
+            return ctx.UI.AlertDialog({
+                title: "已生成访问令牌",
+                text: "开放成功。调用方必须带上这个令牌：\n\n" + s.token + "\n\n离开弹窗后，可以在账号页的「令牌」区再次复制。",
+                confirmText: "知道了",
+                onConfirm: function () { exposeAskState.set(null); },
+                onDismiss: function () { exposeAskState.set(null); },
+                onDismissRequest: function () { exposeAskState.set(null); }
+            });
+        }
+        const tail = s.needKey
+            ? "当前还没有访问令牌，确认后会自动生成一个；没有令牌的请求一律拒绝。"
+            : "调用方必须带上访问令牌；没有令牌的请求一律拒绝。";
+        return ctx.UI.AlertDialog({
+            title: "开放公网访问？",
+            text: "网关会对任何能连上来的 IP 开放，通常还要配合路由器端口映射。\n\n" + tail,
+            confirmText: s.needKey ? "生成令牌并开放" : "确认开放",
+            dismissText: "取消",
+            onConfirm: function () { return doExpose(); },
+            onDismiss: function () { exposeAskState.set(null); },
+            onDismissRequest: function () { exposeAskState.set(null); }
+        });
+    }
+    function gwDialog() {
+        const t = gwBusyState.value;
+        if (!t) return null;
+        return ctx.UI.AlertDialog({
+            title: "正在应用设置",
+            text: String(t),
+            confirmText: "好",
+            onConfirm: function () { gwBusyState.set(null); },
+            onDismiss: function () { gwBusyState.set(null); },
+            onDismissRequest: function () { gwBusyState.set(null); }
+        });
+    }
+    async function doPurge(dirs) {
+        purgeAskState.set(null);
+        const list = (dirs || []).filter(Boolean);
+        if (!list.length) return;
+        try {
+            const r = await RPC("bridge_core:trash_purge", { dirs: list.join(",") });
+            const p = parse(r);
+            if (p && p.success === false) { errState.set(String(p.error || "删除失败")); return; }
+            tickState.set({});
+            await loadTrash();
+        } catch (eP) {
+            errState.set("删除失败：" + String((eP && eP.message) || eP));
+        }
+    }
+    function purgeDialog() {
+        const dirs = purgeAskState.value;
+        if (!dirs || !dirs.length) return null;
+        return ctx.UI.AlertDialog({
+            title: "永久删除",
+            text: "确认把这 " + dirs.length + " 个账号从回收站彻底删除？\n\n删除后无法恢复。",
+            confirmText: "永久删除",
+            dismissText: "取消",
+            onConfirm: function () { return doPurge(dirs); },
+            onDismiss: function () { purgeAskState.set(null); },
+            onDismissRequest: function () { purgeAskState.set(null); }
+        });
+    }
+    function delDialog() {
+        const nm = delState.value;
+        if (!nm) return null;
+        return ctx.UI.AlertDialog({
+            title: "删除账号",
+            text: "确认删除「" + nm + "」？\n\n删除后会进回收站，可以恢复。",
+            confirmText: "确认删除",
+            dismissText: "取消",
+            onConfirm: function () { return opDoDelete(nm); },
+            onDismiss: function () { opCancelDelete(); },
+            onDismissRequest: function () { opCancelDelete(); }
+        });
     }
     function opSetOption(a, patch) {
         return call("bridge_core:bridge_config", { account: a.name, config: JSON.stringify(patch) }, "已保存").then(refresh);
@@ -299,6 +534,7 @@ function Screen(ctx) {
         return call("bridge_core:bridge_token", { account: a.name }, "已生成新令牌").then(function (p) {
             setEd(a.name, {});
             if (p && p.token) revealState.set({ name: a.name, token: String(p.token) });
+            void watchGw("新密钥已生成，网关正在重启…");
             return refresh();
         });
     }
@@ -381,7 +617,26 @@ function Screen(ctx) {
             qrBusyState.set(false);
         }
     }
-    async function opCopy(t) { const x = String(t || ""); if (!x) { TOAST("没有可复制的内容"); return; } try { if (ctx && typeof ctx.copyToClipboard === "function") { await ctx.copyToClipboard(x); TOAST("已复制到剪贴板"); return; } } catch (e0) { } try { const p = parse(await RPC("bridge_core:bridge_clip", { text: x })); if (p && p.success) { TOAST("已复制到剪贴板"); return; } } catch (e1) { } TOAST("自动复制失败，请长按选中复制"); }
+    // 复制走三级：UI 上下文自带方法 → 平台开放的 System.setClipboardText → 主运行时 bridge_clip。
+    // 之前只探测 ctx.copyToClipboard（平台没有这个方法），失败后静默落到终端方案，所以点了没反应。
+    async function opCopy(t) {
+        const x = String(t || "");
+        if (!x) { TOAST("没有可复制的内容"); return; }
+        try { if (ctx && typeof ctx.copyToClipboard === "function") { await ctx.copyToClipboard(x); TOAST("已复制到剪贴板"); return; } } catch (e0) { }
+        try {
+            if (typeof Tools !== "undefined" && Tools && Tools.System && typeof Tools.System.setClipboardText === "function") {
+                await Tools.System.setClipboardText(x);
+                TOAST("已复制到剪贴板");
+                return;
+            }
+        } catch (e1) { }
+        try {
+            const p = parse(await RPC("bridge_core:bridge_clip", { text: x }));
+            if (p && p.success) { TOAST("已复制到剪贴板"); return; }
+            if (p && p.error) { TOAST("复制失败：" + p.error); return; }
+        } catch (e2) { }
+        TOAST("自动复制失败，请长按选中复制");
+    }
     async function opAutoWatch(a, qid) {
         if (__qrWatch) return;
         __qrWatch = true;
@@ -443,21 +698,30 @@ function Screen(ctx) {
     function opSaveCred(a) {
         const e = ed(a.name);
         let cfg = {};
+        const emptyKeys = [];
         if (a.type === "qq") {
             if (e.appId !== undefined) cfg.appId = String(e.appId).trim();
             if (e.appSecret !== undefined) cfg.appSecret = String(e.appSecret).trim();
-            if (!Object.keys(cfg).length) { TOAST("没有改动，无需保存"); return; }
-            if (!cfg.appId || !cfg.appSecret) { errState.set("AppID 和 AppSecret 都要填"); return; }
+            if (!Object.keys(cfg).length) { TOAST("输入框没有改动（开关和档位点一下就已保存）"); return; }
+            if (!cfg.appId) { errState.set("AppID 不能为空"); return; }
+            // AppSecret 在界面上只显示「已保存（不可见）」，用户改别的字段时拿不到原值，不能要求他重填
+            if (!cfg.appSecret && !a.appSecretSet) { errState.set("首次配置要把 AppID 和 AppSecret 都填上"); return; }
+            if (cfg.appSecret === "") delete cfg.appSecret;
         } else if (a.type === "wechat") {
             if (e.token !== undefined) {
                 const tk = String(e.token).trim();
                 if (tk && tk.length < 10) { errState.set("Token 太短（至少 10 字符），请重新扫码或粘贴完整 Token"); return; }
                 if (tk) cfg.token = tk;
             }
-            if (e.baseUrl !== undefined && String(e.baseUrl).trim()) cfg.baseUrl = String(e.baseUrl).trim();
-            if (e.wechatAccountId !== undefined && String(e.wechatAccountId).trim()) cfg.wechatAccountId = String(e.wechatAccountId).trim();
-            if (e.wechatUserId !== undefined && String(e.wechatUserId).trim()) cfg.wechatUserId = String(e.wechatUserId).trim();
-            if (!Object.keys(cfg).length) { TOAST("没有改动，无需保存"); return; }
+            if (e.baseUrl !== undefined) { const v = String(e.baseUrl).trim(); if (v) cfg.baseUrl = v; else emptyKeys.push("BaseUrl"); }
+            if (e.wechatAccountId !== undefined) { const v = String(e.wechatAccountId).trim(); if (v) cfg.wechatAccountId = v; else emptyKeys.push("Bot ID"); }
+            if (e.wechatUserId !== undefined) { const v = String(e.wechatUserId).trim(); if (v) cfg.wechatUserId = v; else emptyKeys.push("User ID"); }
+            if (!Object.keys(cfg).length) {
+                if (emptyKeys.length) errState.set(emptyKeys.join("、") + " 不能为空，未保存");
+                else TOAST("输入框没有改动（开关和档位点一下就已保存）");
+                return;
+            }
+            if (emptyKeys.length) errState.set(emptyKeys.join("、") + " 为空，这几项没有保存");
         } else {
             if (e.port !== undefined && String(e.port).trim()) {
                 const pn = Number(String(e.port).trim());
@@ -469,7 +733,7 @@ function Screen(ctx) {
                 if (!/^sk-/.test(tk) || tk.length < 20) { errState.set("令牌需以 sk- 开头且至少 20 字符"); return; }
                 cfg.token = tk;
             }
-            if (!Object.keys(cfg).length) { TOAST("没有改动，无需保存"); return; }
+            if (!Object.keys(cfg).length) { TOAST("输入框没有改动（开关和档位点一下就已保存）"); return; }
         }
         return call("bridge_core:bridge_config", { account: a.name, config: JSON.stringify(cfg) }, a.name + " 已保存").then(function (p) {
             clearEd(a.name);
@@ -498,18 +762,12 @@ function Screen(ctx) {
                     ? IBTN({ icon: "check", onClick: function () { return opRename(a); } })
                     : IBTN({ icon: "edit", onClick: function () { setEd(a.name, { newName: a.name }); renameState.set(a.name); delState.set(""); } }),
                 IBTN({
-                    icon: delState.value === a.name ? "delete_forever" : "delete",
+                    icon: "delete",
                     tint: delState.value === a.name ? "error" : "onSurfaceVariant",
-                    onClick: function () { return delState.value === a.name ? opDoDelete(a) : opAskDelete(a); }
+                    onClick: function () { return opAskDelete(a); }
                 }),
                 ctx.UI.Switch({ checked: a.enabled !== false, onCheckedChange: function (v) { return opToggle(a, v); } })
             ]));
-            if (delState.value === a.name) {
-                rows.push(ctx.UI.Row({ verticalAlignment: "center", spacing: 8 }, [
-                    TXT({ text: "确认删除 " + a.name + "？会进回收站，可恢复", style: "labelSmall", color: "error", weight: 1 }),
-                    BTN({ onClick: function () { return opCancelDelete(); } }, [TXT({ text: "取消" })])
-                ]));
-            }
 
             const left = [];
             const right = [];
@@ -606,10 +864,14 @@ function Screen(ctx) {
                 }));
                 d.push(TXT({ text: "监听范围", style: "bodyMedium", fontWeight: "bold" }));
                 const _exp = a.expose || "local";
-                d.push(ctx.UI.Row({ spacing: 6 }, [
-                    BTN({ weight: 1, onClick: function () { return opSetExpose(a, "local"); } }, [TXT({ text: (_exp === "local" ? "✓ " : "") + "仅本机" })]),
-                    BTN({ weight: 1, onClick: function () { return opSetExpose(a, "lan"); } }, [TXT({ text: (_exp === "lan" ? "✓ " : "") + "局域网" })]),
-                    BTN({ weight: 1, onClick: function () { return opSetExpose(a, "public"); } }, [TXT({ text: (_exp === "public" ? "✓ " : "") + "公网" })])
+                // 用底色区分当前档位，文字保持 2~3 字，窄屏不会挤成两行
+                const _expBtn = function (key, label) {
+                    return SEG(_exp === key, label, function () { return opAskExpose(a, key); }, "labelLarge");
+                };
+                d.push(ctx.UI.Row({ spacing: 6, fillMaxWidth: true }, [
+                    _expBtn("local", "本机"),
+                    _expBtn("lan", "局域网"),
+                    _expBtn("public", "公网")
                 ]));
                 d.push(TXT({
                     text: _exp === "local"
@@ -641,7 +903,8 @@ function Screen(ctx) {
                     ]));
                     d.push(TXT({ text: "清除后可手动自定义令牌", style: "labelSmall", color: "onSurfaceVariant" }));
                 } else {
-                    d.push(lockField(a, e, "pub", "token", "自定义访问令牌", a.token || "", "手动输入或点随机生成"));
+                    d.push(BTN({ onClick: function () { setEd(a.name, { __ed_pub: !e.__ed_pub }); } }, [TXT({ text: e.__ed_pub ? "收起" : "手动填写令牌" })]));
+                                        d.push(lockField(a, e, "pub", "token", "自定义访问令牌", a.token || "", "手动输入或点随机生成"));
                     d.push(ctx.UI.Row({ spacing: 8 }, [
                         BTN({ weight: 1, onClick: function () { return opRegenConfirm(a); } }, [TXT({ text: regState.value === a.name ? "确认生成？" : "随机生成" })]),
                         BTN({ weight: 1, onClick: function () { setEd(a.name, { token: "" }); } }, [TXT({ text: "清除" })])
@@ -658,16 +921,6 @@ function Screen(ctx) {
                 text: a.waifuSplit ? "已开启：回复交给 Waifu 模式插件切句，逐条气泡发送；没装或调用失败时自动回退" : "已关闭：只有超过 1500 字时才按标点机械切分",
                 style: "labelSmall", color: "onSurfaceVariant"
             }));
-            if (a.type === "qq") {
-                d.push(ctx.UI.Row({ verticalAlignment: "center", spacing: 8 }, [
-                    TXT({ text: "接收全部群消息（关闭＝仅 @ 我）", style: "bodyMedium", weight: 1 }),
-                    ctx.UI.Switch({ checked: a.groupAll === true, onCheckedChange: function (v) { return opSetOption(a, { groupAll: !!v }); } })
-                ]));
-                d.push(TXT({
-                    text: a.groupAll ? "已开启：群里没 @ 我的消息也会进对话（需平台已给全量消息权限）" : "只回 @ 我 的群消息，其余直接丢弃",
-                    style: "labelSmall", color: "onSurfaceVariant"
-                }));
-            }
 
             d.push(TXT({ text: "── 对话绑定 ──", style: "labelMedium", color: "primary" }));
             if (a.chatId) {
@@ -819,12 +1072,15 @@ function Screen(ctx) {
 
     const trashState = useS(ctx, "trashItems", null);
     const tickState = useS(ctx, "ticks", {});
+    const purgeAskState = useS(ctx, "purgeAsk", null);
+    const trashLoaded = useS(ctx, "trashLoaded", false);
 
     async function loadTrash() {
         try {
             const r = await RPC("bridge_core:trash_list", {});
             const p = parse(r);
-            if (p && p.items) trashState.set(p.items);
+            if (p && Array.isArray(p.items)) trashState.set(p.items);
+            else if (p && p.success === false) errState.set(String(p.error || "回收站读取失败"));
         } catch (e) { errState.set("读取回收站失败：" + String(e && e.message ? e.message : e)); }
     }
 
@@ -836,20 +1092,14 @@ function Screen(ctx) {
     }
 
     function chanTab(key, label) {
-        const cfgT = { weight: 1, onClick: function () { chanState.set(key); selState.set(""); qrState.set(null); delState.set(""); if (key === "trash") void loadTrash(); } };
-        const lbT = TXT({ text: label, style: "labelSmall", textAlign: "center", fillMaxWidth: true, maxLines: 1 });
-        return BTN(Object.assign({ content: [lbT] }, cfgT));
+        return SEG(chanState.value === key, label, function () {
+            chanState.set(key); selState.set(""); qrState.set(null); delState.set("");
+            if (key === "trash") void loadTrash();
+        }, "labelSmall");
     }
 
     function aboutLink(label, url) {
-        const copyIt = async function () {
-            let ok = false;
-            try { await ctx.copyToClipboard(url); ok = true; } catch (_e) { }
-            if (!ok) {
-                try { const r = await RPC("bridge_core:bridge_clip", { text: url }); const p = parse(r); if (p && p.success !== false) ok = true; } catch (_e2) { }
-            }
-            if (!ok) errState.set("复制失败");
-        };
+        const copyIt = function () { return opCopy(url); };
         return ctx.UI.Row({ verticalAlignment: "center", spacing: 8, fillMaxWidth: true }, [
             TXT({ text: label, style: "bodyMedium", color: "onSurfaceVariant" }),
             TXT({ text: url, style: "labelSmall", color: "onSurfaceVariant", weight: 1 }),
@@ -913,6 +1163,8 @@ function Screen(ctx) {
     }
 
     function tabTrash() {
+        // 首次进回收站就自动取数，不用先点一次「刷新」
+        if (!trashLoaded.value) { trashLoaded.set(true); void loadTrash(); }
         const items = trashState.value || [];
         const ticks = tickState.value || {};
         const chosen = items.filter(function (x) { return ticks[x.dir]; }).map(function (x) { return x.dir; });
@@ -942,16 +1194,13 @@ function Screen(ctx) {
             } }, [TXT({ text: "恢复" })]),
             BTN({ weight: 1, onClick: function () { const m = {}; items.forEach(function (x) { m[x.dir] = true; }); tickState.set(m); } }, [TXT({ text: "全选" })]),
             BTN({ weight: 1, onClick: function () { tickState.set({}); } }, [TXT({ text: "取消" })]),
-            BTN({ weight: 1, enabled: chosen.length > 0, onClick: async function () {
-                const r = await RPC("bridge_core:trash_purge", { dirs: chosen.join(",") });
-                const p = parse(r); if (p && p.success === false) { errState.set(String(p.error || "删除失败")); return; }
-                tickState.set({}); await loadTrash();
-            } }, [TXT({ text: "删除" })])
+            BTN({ weight: 1, enabled: chosen.length > 0, onClick: function () { purgeAskState.set(chosen.slice()); } }, [TXT({ text: "删除" })])
         ]));
         return ctx.UI.Column({ spacing: 8 }, rows);
     }
 
-    return ctx.UI.LazyColumn({
+    return ctx.UI.Box({ fillMaxSize: true }, [
+        ctx.UI.LazyColumn({
         onLoad: async function () {
             try {
                 pageState.set(""); selState.set(""); delState.set(""); renameState.set(""); regState.set(""); qrState.set(null);
@@ -976,9 +1225,10 @@ function Screen(ctx) {
             { key: "channels", label: "通道" },
             { key: "settings", label: "设置" }
         ].map(function (c) {
-            const cfgN = { weight: 1, onClick: function () { navState.set(c.key); selState.set(""); qrState.set(null); delState.set(""); if (c.key === "trash") void loadTrash(); } };
-            const lbN = TXT({ text: c.label, style: "bodyMedium", textAlign: "center", fillMaxWidth: true, maxLines: 1 });
-            return BTN(Object.assign({ content: [lbN] }, cfgN));
+            return SEG(navState.value === c.key, c.label, function () {
+                navState.set(c.key); selState.set(""); qrState.set(null); delState.set("");
+                if (c.key === "trash") void loadTrash();
+            }, "bodyMedium");
         })),
 
         // ═══ 通道：微信 / QQ / 公开 / 回收 ═══
@@ -1001,5 +1251,10 @@ function Screen(ctx) {
                     : (chanState.value === "trash"
                         ? ctx.UI.Column({ spacing: 12 }, [tabTrash()])
                         : ctx.UI.Column({ spacing: 12 }, [tabOverview(), tabMsgs()]))
+    ].filter(Boolean)),
+        exposeDialog(),
+        delDialog(),
+        purgeDialog(),
+        gwDialog()
     ].filter(Boolean));
 }
