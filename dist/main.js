@@ -47,10 +47,29 @@ function __isBusy(st) {
     return sc === "processing" || sc === "executing" || sc === "running";
 }
 
+// 平台有两种返回结构，成败字段位置不一样：
+//   Files.write → FileApplyResultData { operation: FileOperationData, ... }，成败在 r.operation.successful
+//   Files.move / deleteFile / mkdir / copy → FileOperationData { operation: string, successful: bool }，成败在 r.successful
+// 失败时可能既不抛异常、也不生效，只凭「没抛异常」判定成功会静默丢配置。
+function __opOk(r) {
+    try {
+        if (typeof r.successful === "boolean") return r.successful;
+        if (r && r.operation && typeof r.operation.successful === "boolean") return r.operation.successful;
+    } catch (e) { }
+    return true;
+}
 async function writeFile(p, c) {
     var txt = String(c);
-    try { await Tools.Files.write(p, txt); state.io = "Files.write"; return true; } catch (e) { state.ioErr = errText(e); }
-    try { await Tools.Files.write(p, txt, false, "android"); state.io = "Files.write(env)"; return true; } catch (e) { state.ioErr = errText(e); }
+    try {
+        var r1 = await Tools.Files.write(p, txt);
+        if (__opOk(r1)) { state.io = "Files.write"; return true; }
+        state.ioErr = String((r1 && r1.operation && r1.operation.details) || "write failed");
+    } catch (e) { state.ioErr = errText(e); }
+    try {
+        var r2 = await Tools.Files.write(p, txt, false);
+        if (__opOk(r2)) { state.io = "Files.write(retry)"; return true; }
+        state.ioErr = String((r2 && r2.operation && r2.operation.details) || "write failed");
+    } catch (e2) { state.ioErr = errText(e2); }
     return false;
 }
 async function readFile(p) {
@@ -62,6 +81,16 @@ var SEEN_PATH = HUB + "rt_seen.json";
 // [fix] 内存里 state.seen 最多保留 1024 条，但原先只持久化最后 500 条，
 // 重启后丢失 524 条去重记录，可能造成旧消息被重复处理。改为与内存上限一致。
 var SEEN_KEEP = 1024;
+// Tools.Files.exists 返回的是 { path, exists, isDirectory, size } 对象，不是布尔值。
+// 直接拿它当条件判断永远为真，会让「目录还在不在」「删除成没成功」全部判错，统一走这里。
+async function fsExists(p) {
+    var r = await Tools.Files.exists(p);
+    if (r && typeof r === "object") {
+        if (typeof r.exists === "boolean") return r.exists;
+        return true;
+    }
+    return !!r;
+}
 async function saveSeen() {
     try { var arr = state.seen.slice(-SEEN_KEEP); await writeFile(SEEN_PATH, JSON.stringify(arr)); } catch (e) {}
 }
@@ -356,6 +385,10 @@ async function __deliverOnce(name, channel, runtime, peer, text) {
             if (!f2) throw new Error("no peer");
             await wxReply(runtime, f2, String((peer && peer.ctx) || ""), body);
             ok = true;
+        } else {
+            // [fix] 未知通道原来会「指纹已经预占、但一条都没发、也不撤占」，
+            // 这条回复以后就永远不会再补发。抛出去让 catch 把预占撤掉。
+            throw new Error("unknown channel: " + channel);
         }
     } catch (e) {
         // 发送失败要把预占撤掉，否则这条永远不会再补
@@ -375,7 +408,9 @@ async function __deliverOnce(name, channel, runtime, peer, text) {
 // 于是把好几天前的旧回复又发了一遍（用户收到「古早消息」就是这个原因）。
 // 这里在 restore 时记下每个对话当前的消息条数作为基线，只补「基线之后新增」的消息。
 var __sweepBase = {};
-async function __sweepCaptureBase() {
+// [fix] onlyMissing=true 时只补「还没记过」的账号，用于通道启动后再补一次
+// （那时 runtime.chatId 可能是 rebind 出来的新 ID，比 cfg.chatId 更准）。
+async function __sweepCaptureBase(onlyMissing) {
     try {
         for (var i = 0; i < state.accounts.length; i++) {
             var a = state.accounts[i] || {};
@@ -383,6 +418,7 @@ async function __sweepCaptureBase() {
             var name = cfg.name || "";
             var ch = cfg.channel || "wechat";
             if (ch !== "qq" && ch !== "wechat") continue;
+            if (onlyMissing && __sweepBase[name] !== undefined) continue;
             var chatId = (state.chatFix && state.chatFix[name]) || (a.runtime && a.runtime.chatId) || cfg.chatId || "";
             if (!chatId) continue;
             try {
@@ -448,8 +484,18 @@ async function __sweepOne(acc, gen) {
             if (peer) peer.fresh = false;
             var ok = await __deliverOnce(name, ch, rt, peer, aiTxt);
             await rlog(ok ? ("SWEEP_OK " + name) : ("SWEEP_FAIL " + name));
-        } catch (e) { await rlog("SWEEP_FAIL " + name + " " + errText(e)); }
-    } catch (e) { await rlog("SWEEP_ERR " + errText(e)); }
+            } catch (e) { await rlog("SWEEP_FAIL " + name + " " + errText(e)); }
+    } catch (e) {
+        var _em1 = errText(e);
+        // [fix] 账号绑定的对话被删掉后，补偿扫描每次启动都会拿这个死 chatId 去读消息，
+        // 抛「Chat does not exist」，日志里看着像故障。真实消息到达时 process() 会自动
+        // 重新绑定，这里只要安静跳过即可，别让假错误盖住真问题。
+        if (_em1.indexOf("does not exist") >= 0 || _em1.indexOf("not exist") >= 0) {
+            await rlog("SWEEP_CHAT_GONE " + name + "（绑定对话已删除，等新消息到达时自动重绑）");
+            return;
+        }
+        await rlog("SWEEP_ERR " + _em1);
+    }
 }
 // [fix] 入站补偿：用户消息已经到了（last_peer 里有原文），但对话里最后一条还是
 // 用户消息、且这条根本没被成功处理（seen 里没有），说明插件在处理前就挂了。
@@ -488,7 +534,14 @@ async function __sweepInbound(acc, gen) {
         await rlog("SWEEP_INBOUND " + name + " msg=" + pid + " len=" + ptext.length);
         await process(name, ch === "qq" ? "qq" : "wechat", String(peer.from || ""), pid, ptext, chatId, []);
         await rlog("SWEEP_INBOUND_DONE " + name);
-    } catch (e) { await rlog("SWEEP_IN_ERR " + errText(e)); }
+    } catch (e) {
+        var _em2 = errText(e);
+        if (_em2.indexOf("does not exist") >= 0 || _em2.indexOf("not exist") >= 0) {
+            await rlog("SWEEP_IN_CHAT_GONE " + name);
+            return;
+        }
+        await rlog("SWEEP_IN_ERR " + _em2);
+    }
 }
 
 var __sweepRan = false;
@@ -531,7 +584,7 @@ async function __mediaClean() {
             // 中间标记文件：job_ / done_ 且超 10 分钟的直接删掉
             if (/^(job_|done_)/.test(nm) && nm.slice(-5) === ".json") {
                 if (!mt || (now0 - mt > 600000)) {
-                    try { await Tools.Files.delete(MEDIA_DIR + nm); staleMark++; } catch (eM) { }
+                    try { await Tools.Files.deleteFile(MEDIA_DIR + nm); staleMark++; } catch (eM) { }
                 }
                 continue;
             }
@@ -546,7 +599,7 @@ async function __mediaClean() {
             var tooOld = f.mtime && (now - f.mtime > MEDIA_KEEP_MS);
             var tooMany = k >= MEDIA_KEEP_N;
             if (!tooOld && !tooMany) continue;
-            try { await Tools.Files.delete(MEDIA_DIR + f.name); killed++; } catch (eD) { }
+            try { await Tools.Files.deleteFile(MEDIA_DIR + f.name); killed++; } catch (eD) { }
         }
         if (killed) await rlog("MEDIA_CLEAN " + killed + " left=" + (files.length - killed));
     } catch (e) { }
@@ -974,7 +1027,7 @@ async function wxTypingStop(a, userId) {
     if (_st && _left > 0) { await sleep(_left); }
     delete __typingStart[key];
     __typingLive[key] = false;
-    try { await Tools.Files.delete(HUB + "typing/" + a.name + ".json"); } catch (e) { }
+    try { await Tools.Files.deleteFile(HUB + "typing/" + a.name + ".json"); } catch (e) { }
     await rlog("WX_TYPING_KEEP " + a.name + " done");
 }
 
@@ -1070,7 +1123,7 @@ async function __wxMedia(a, m, msgId) {
                     var rj = await readFile(MEDIA_DIR + "done_" + jobTag + ".json");
                     if (rj) {
                         var jd = JSON.parse(rj);
-                        try { await Tools.Files.delete(MEDIA_DIR + "done_" + jobTag + ".json"); } catch (eD) { }
+                        try { await Tools.Files.deleteFile(MEDIA_DIR + "done_" + jobTag + ".json"); } catch (eD) { }
                         if (jd && jd.ok) got = String(jd.path || "").replace("/storage/emulated/0", "/mnt/android/sdcard");
                         else await rlog("WX_MEDIA_FAIL " + a.name + " " + job.kind + " " + String(jd && jd.err));
                         break;
@@ -1197,6 +1250,11 @@ async function startWechat(acc, gen) {
     await rlog("WX_START " + cfg.name + " chat=" + (a.chatId || "-") + " tokenLen=" + a.token.length);
     await markRun(cfg.name, true);
     void ensureWxPoll();
+    // [fix] 之前把 Python 的 wxpoll.py 停掉、改成「只保留 JS 轮询」时，只写了停的那一半，
+    // 忘了启动 __wxTick —— 结果微信通道白天黑夜都没有任何东西在拉 getupdates，
+    // accounts/wx-1/sync_buf.txt 一直停在 6 天前，日志里 WX_POLL 一条都没有，
+    // 表现就是「微信发消息一点反应都没有」。__wxTick 原来只在公开接口的 startHttp 里调用过。
+    void __wxTick(a, gen);
 }
 
 // ============ 通用接口账号 ============
@@ -1241,6 +1299,9 @@ async function qqTokenOf(a) {
     a.qqTokenExp = now + (Number(j.expires_in || 7200) * 1000);
     return a.qqToken;
 }
+// 存活的 QQ 运行时。重连时 startQQ 会拿到一个临时 acc，新建的 runtime 不在
+// state.accounts 里，只按 state.accounts 清理会漏掉它，旧连接就再也关不掉。
+var __qqLive = [];
 async function startQQ(acc, gen) {
     var cfg = acc.cfg;
     var aj = await readJsonSafe(HUB + "accounts/" + cfg.name + "/account.json", {});
@@ -1250,6 +1311,21 @@ async function startQQ(acc, gen) {
         running: true, ws: null, seq: null, hb: 0, nextHb: 0, awaitingAck: true, sessionId: "", qqToken: "", qqTokenExp: 0
     };
     acc.runtime = a;
+    // [fix] 重连时传进来的是临时对象 {cfg:...}，新 runtime 只挂在它身上，
+    // state.accounts[i].runtime 仍然指向那个已经 stopped 的旧对象。
+    // 外部（补偿扫描、状态快照、发送）拿到旧对象时，ws 已是 null，容易判错状态。
+    try {
+        for (var _ri = 0; _ri < state.accounts.length; _ri++) {
+            var _ra = state.accounts[_ri];
+            if (_ra && _ra !== acc && _ra.cfg && _ra.cfg.name === cfg.name) _ra.runtime = a;
+        }
+    } catch (eRs) { }
+    __qqLive.push(a);
+    if (__qqLive.length > 16) {
+        var _keep = [];
+        for (var _qi2 = 0; _qi2 < __qqLive.length; _qi2++) { if (__qqLive[_qi2] && __qqLive[_qi2].ws) _keep.push(__qqLive[_qi2]); }
+        __qqLive = _keep;
+    }
     if (!a.appId || !a.appSecret) { a.running = false; await rlog("QQ_SKIP_NO_CRED " + cfg.name); return; }
     try {
         var tok = await qqTokenOf(a);
@@ -1286,6 +1362,7 @@ async function qqSend(a, obj) {
 async function qqStop(a) {
     a.running = false;
     if (a.ws) { try { await Tools.Net.webSocket({ op: "close", handle: a.ws }); } catch (e) {} a.ws = null; }
+    try { var _k = __qqLive.indexOf(a); if (_k >= 0) __qqLive.splice(_k, 1); } catch (e0) { }
 }
 async function qqTick(a, gen) {
     if (!(state.running && a.running && gen === state.gen && a.ws)) return;
@@ -1328,7 +1405,7 @@ async function qqFrame(a, gen, f) {
         a.nextHb = Date.now() + a.hb;
         var tk = await qqTokenOf(a);
         if (a.sessionId) await qqSend(a, { op: 6, d: { token: "QQBot " + tk, session_id: a.sessionId, seq: a.seq } });
-        else await qqSend(a, { op: 2, d: { token: "QQBot " + tk, intents: (1 << 25), shard: [0, 1], properties: { os: "operit", browser: "operit", device: "operit" } } });
+        else { await rlog("QQ_IDENTIFY " + a.name + " intents=" + (1 << 25)); await qqSend(a, { op: 2, d: { token: "QQBot " + tk, intents: (1 << 25), shard: [0, 1], properties: { os: "operit", browser: "operit", device: "operit" } } }); }
         return;
     }
     if (op === 11) { a.awaitingAck = true; return; }
@@ -1336,15 +1413,19 @@ async function qqFrame(a, gen, f) {
     if (op === 9) { if (f.d === false) { a.sessionId = ""; a.seq = null; } throw new Error("QQ_OP9_INVALID_SESSION"); }
     if (op === 0) {
         var t = String(f.t || "");
-        if (t === "READY") { a.sessionId = String((f.d || {}).session_id || ""); await rlog("QQ_READY " + a.name); return; }
+        await rlog("QQ_EVT " + a.name + " t=" + t);
+        if (t === "READY") {
+            a.sessionId = String((f.d || {}).session_id || "");
+            // [fix] 原来 state.qqRetry 只加不减：连续失败 3 次之后就永远不再重连，
+            // 通道彻底静默死亡（只有重载插件才恢复）。真正连上就清零。
+            state.qqRetry = 0;
+            await rlog("QQ_READY " + a.name);
+            return;
+        }
         if (t === "RESUMED") return;
-        if (t === "C2C_MESSAGE_CREATE" || t === "GROUP_AT_MESSAGE_CREATE" || t === "GROUP_MESSAGE_CREATE") {
-            // 群聊默认只吃「@ 我」的消息。GROUP_MESSAGE_CREATE 是群里的普通消息
-            // （需要平台给全量消息权限才会推），只有账号显式打开「接收全部群消息」才处理。
-            if (t === "GROUP_MESSAGE_CREATE" && !(a.cfg && a.cfg.groupAll)) {
-                await rlog("QQ_GROUP_AT_ONLY " + a.name + " 丢弃非@群消息");
-                return;
-            }
+        if (t === "C2C_MESSAGE_CREATE" || t === "GROUP_AT_MESSAGE_CREATE") {
+            // 群里只有 @ 机器人 的消息会被平台推送。QQ 侧没有给公域机器人
+            // 「全量群消息」权限，GROUP_MESSAGE_CREATE 实际收不到，所以只处理这两类。
             await qqMessage(a, gen, t, f.d || {});
         }
     }
@@ -1399,7 +1480,7 @@ async function __qqMedia(a, atts, msgId) {
                     var rj = await readFile(MEDIA_DIR + "done_" + jobTag + ".json");
                     if (rj) {
                         var jd = JSON.parse(rj);
-                        try { await Tools.Files.delete(MEDIA_DIR + "done_" + jobTag + ".json"); } catch (eD) { }
+                        try { await Tools.Files.deleteFile(MEDIA_DIR + "done_" + jobTag + ".json"); } catch (eD) { }
                         if (jd && jd.ok) got = String(jd.path || "").replace("/storage/emulated/0", "/mnt/android/sdcard");
                         else await rlog("QQ_MEDIA_FAIL " + a.name + " " + job.kind + " " + String(jd && jd.err));
                         break;
@@ -1562,7 +1643,7 @@ async function __ensureMediaWorker() {
         }
     } catch (eW) { await rlog("MEDIA_WORKER_WRITE_ERR " + errText(eW)); }
     try {
-        var r = await __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && if [ -f media.pid ] && kill -0 $(cat media.pid) 2>/dev/null; then kill $(cat media.pid) 2>/dev/null; fi; sleep 0.4; (setsid nohup python3 media_worker.py >> media.log 2>&1 & echo $! > media.pid); sleep 1; cat media.pid 2>/dev/null");
+        var r = await __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && ( [ -f media.pid ] && kill -9 $(cat media.pid) 2>/dev/null ); rm -f media.pid; pkill -9 -f 'media_worker[.]py' 2>/dev/null; sleep 0.4; (setsid nohup python3 media_worker.py >> media.log 2>&1 & echo $! > media.pid); sleep 1; cat media.pid 2>/dev/null");
         await rlog("MEDIA_WORKER_UP " + String((r && r.output) || "").trim());
     } catch (e2) { await rlog("MEDIA_WORKER_ERR " + errText(e2)); }
 }
@@ -1663,7 +1744,32 @@ function gwExposeOf(a) {
     if (e === "lan" || e === "public" || e === "local") return e;
     return (a && a.allowPublic) ? "public" : "local";
 }
-async function ensureGateway() {
+// 读网关 /health：既判断活没活，也判断跑的是不是当前配置（expose 不同就必须重启）
+async function gwHealth(port) {
+    try {
+        var r = await Tools.Net.http({ url: "http://127.0.0.1:" + port + "/health", method: "GET", connect_timeout: 2, read_timeout: 2, responseType: "text" });
+        if (!r) return null;
+        var j = null;
+        try { j = JSON.parse(String(r.content || "")); } catch (eJ) { j = null; }
+        return { statusCode: r.statusCode, json: j };
+    } catch (e) { return null; }
+}
+// 杀掉所有 gw.py 进程：pid 文件 + 进程名双保险。
+// 进程名用 [g]w.py 写法，避免 grep 匹配到这条命令自己（否则会把执行终端一起杀掉）。
+async function gwKillAll() {
+    var cmd = "cd /storage/emulated/0/Download/Operit/bridge_hub; "
+        + "( [ -f gw.pid ] && kill -9 $(cat gw.pid) 2>/dev/null ); rm -f gw.pid; "
+        + "pkill -9 -f 'gw[.]py' 2>/dev/null; "
+        + "for p in $(ps -ef 2>/dev/null | grep '[g]w[.]py' | awk '{print $1}'); do kill -9 $p 2>/dev/null; done; "
+        + "sleep 0.6; echo GW_KILLED";
+    try {
+        var r = await __termExec(cmd);
+        var out = String((r && r.output) || "");
+        await rlog("GW_KILL " + out.trim().slice(0, 40));
+        return out.indexOf("GW_KILLED") >= 0;
+    } catch (e) { await rlog("GW_KILL_ERR " + errText(e)); return false; }
+}
+async function gwEnsureOnce() {
     var ports = [];
     try {
         var cfg = state.cfg || state.cfgOverride || {};
@@ -1681,36 +1787,110 @@ async function ensureGateway() {
     var same = false;
     try { same = (JSON.stringify(JSON.parse(curTxt)) === want); } catch (e) { same = false; }
 
-    var alive = 0;
+    var alive = 0, mismatch = false;
     for (var pi = 0; pi < ports.length; pi++) {
-        try {
-            var r = await Tools.Net.http({ url: "http://127.0.0.1:" + ports[pi].port + "/health", method: "GET", connect_timeout: 2, read_timeout: 2, responseType: "text" });
-            if (r && r.statusCode === 200) alive++;
-        } catch (e) {}
+        var h0 = await gwHealth(ports[pi].port);
+        if (h0 && h0.statusCode === 200) {
+            alive++;
+            if (String((h0.json && h0.json.expose) || "") !== String(ports[pi].expose)) mismatch = true;
+        }
     }
+    if (mismatch) await rlog("GW_EXPOSE_STALE want=" + ports[0].expose);
     var _curGw = "";
     try { _curGw = await readFile(GW_PATH); } catch (eG) { }
-    await rlog("GW_CHECK cur=" + String(_curGw || "").length + " want=" + GW_SRC.length);
-    try {
-        await writeFile(GW_PATH, GW_SRC);
-        var _cp = await __termExec("echo U1JDPS9kYXRhL2RhdGEvYXBwLm9wZXJpdC9maWxlcy9ydW50aW1lL2lkZW50aXRpZXM7IEY9JChmaW5kICRTUkMgLXBhdGggKi9wbHVnaW5zL2RhdGEvYnJpZGdlX2h1Yi9ndy5weSAyPi9kZXYvbnVsbCB8IGhlYWQgLTEpOyBpZiBbIC1mICRGIF07IHRoZW4gY3AgLWYgJEYgL3N0b3JhZ2UvZW11bGF0ZWQvMC9Eb3dubG9hZC9PcGVyaXQvYnJpZGdlX2h1Yi9ndy5weSAmJiBlY2hvIEdXX0NQX09LOyBlbHNlIGVjaG8gR1dfQ1BfTk9TUkM7IGZp | base64 -d | sh");
-        await rlog("GW_SYNC " + String((_cp && _cp.output) || "-").trim().slice(0, 40));
-    } catch (eW2) { await rlog("GW_SYNC_ERR " + errText(eW2)); }
-    if (same && alive === ports.length) { await rlog("GW_ALIVE " + ports.length); return; }
+    var _sameSrc = (_curGw === GW_SRC);
+    await rlog("GW_CHECK cur=" + String(_curGw || "").length + " want=" + GW_SRC.length + " same=" + _sameSrc);
+    if (!_sameSrc) {
+        // 只有源码变了才需要把插件里的 gw.py 拷到运行目录（这一步要扫目录，能省就省）
+        try {
+            await writeFile(GW_PATH, GW_SRC);
+            var _cp = await __termExec("echo U1JDPS9kYXRhL2RhdGEvYXBwLm9wZXJpdC9maWxlcy9ydW50aW1lL2lkZW50aXRpZXM7IEY9JChmaW5kICRTUkMgLXBhdGggKi9wbHVnaW5zL2RhdGEvYnJpZGdlX2h1Yi9ndy5weSAyPi9kZXYvbnVsbCB8IGhlYWQgLTEpOyBpZiBbIC1mICRGIF07IHRoZW4gY3AgLWYgJEYgL3N0b3JhZ2UvZW11bGF0ZWQvMC9Eb3dubG9hZC9PcGVyaXQvYnJpZGdlX2h1Yi9ndy5weSAmJiBlY2hvIEdXX0NQX09LOyBlbHNlIGVjaG8gR1dfQ1BfTk9TUkM7IGZp | base64 -d | sh");
+            await rlog("GW_SYNC " + String((_cp && _cp.output) || "-").trim().slice(0, 40));
+        } catch (eW2) { await rlog("GW_SYNC_ERR " + errText(eW2)); }
+    }
+    if (same && !mismatch && alive === ports.length) { await rlog("GW_ALIVE " + ports.length); return; }
+
+    // 全端口都是「仅本机」时，密钥根本用不上（回环免鉴权），只改密钥不必重启网关
+    var _allLocal = true;
+    for (var la = 0; la < ports.length; la++) if (String(ports[la].expose) !== "local") _allLocal = false;
+    if (_allLocal && alive === ports.length && !mismatch) {
+        if (!same) await writeFile(HUB + "gw_ports.json", want);
+        await rlog("GW_KEY_LOCAL_SKIP");
+        return;
+    }
+    __gwApplying = true;
 
     await writeFile(HUB + "gw_ports.json", want);
-    try { await __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && if [ -f gw.pid ] && kill -0 $(cat gw.pid) 2>/dev/null; then kill $(cat gw.pid) 2>/dev/null; fi; sleep 1; rm -f gw.pid"); } catch (e) {}
+    // 旧进程会和 pid 文件对不上（每次重启都换 pid），只按 pid 杀常常漏杀，
+    // 漏杀时新进程 bind 失败（Errno 98）、旧进程继续按老档位跑 —— 这正是「切了公网实际还是局域网」的原因。
+    var _killed = await gwKillAll();
+    if (!_killed) { await sleep(400); _killed = await gwKillAll(); }
+    for (var kw = 0; kw < 12; kw++) {
+        var hk = await gwHealth(ports[0].port);
+        if (!hk) break;
+        await sleep(150);
+    }
+    if (!_killed) await rlog("GW_KILL_SOFT_FAIL");
+    var _busy = await gwHealth(ports[0].port);
+    if (_busy && _busy.statusCode === 200) {
+        // 端口还被占着：再起一个只会 bind 失败留个僵尸进程，这里直接放弃并留痕
+        await rlog("GW_PORT_BUSY_SKIP_SPAWN expose_now=" + String((_busy.json && _busy.json.expose) || "?"));
+        __gwApplying = false;
+        return;
+    }
 
     if (_curGw !== GW_SRC) { await writeFile(GW_PATH, GW_SRC); }
 
     try {
-        var sp = await __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && (setsid nohup python3 gw.py --config gw_ports.json >> gw.log 2>&1 & echo $! > gw.pid); sleep 2; echo GW_SPAWNED $(cat gw.pid 2>/dev/null)");
+        var sp = await __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && (setsid nohup python3 gw.py --config gw_ports.json >> gw.log 2>&1 & echo $! > gw.pid); sleep 1.2; echo GW_SPAWNED $(cat gw.pid 2>/dev/null)");
         await rlog("GW_SPAWN " + String((sp && sp.output) || "-").trim().slice(0, 60));
     } catch (e2) { await rlog("GW_SPAWN_ERR " + errText(e2)); }
     try {
-        var hz = await Tools.Net.http({ url: "http://127.0.0.1:" + ports[0].port + "/health", method: "GET", connect_timeout: 3, read_timeout: 3, responseType: "text" });
-        await rlog("GW_HEALTH " + (hz ? hz.statusCode : "-"));
+        var hz2 = await gwHealth(ports[0].port);
+        var exNow = String((hz2 && hz2.json && hz2.json.expose) || "");
+        await rlog("GW_HEALTH " + (hz2 ? hz2.statusCode : "-") + " expose=" + (exNow || "?") + " want=" + ports[0].expose);
+        if (!hz2 || hz2.statusCode !== 200) await rlog("GW_BIND_FAIL want=" + ports[0].expose);
+        else if (exNow && exNow !== String(ports[0].expose)) await rlog("GW_EXPOSE_MISMATCH want=" + ports[0].expose + " got=" + exNow);
     } catch (e3) { await rlog("GW_HEALTH_ERR " + errText(e3)); }
+    __gwApplying = false;
+}
+
+// 网关相关的操作串行化：插件启动恢复、后台应用、手动重载可能同时触发，
+// 不排队会出现两个 gw.py 抢同一个端口。
+var __gwApplying = false, __gwChain = Promise.resolve();
+function ensureGateway() {
+    var run = function () {
+        // 无论成败都要把「正在重启」标记清掉，否则界面弹窗会一直挂着
+        return gwEnsureOnce().then(function (r) { __gwApplying = false; return r; },
+            function (e) { __gwApplying = false; throw e; });
+    };
+    var p = __gwChain.then(run, run);
+    __gwChain = p.then(function () { }, function () { });
+    return p;
+}
+
+// 改配置时不要让界面等网关重启（杀进程 + 等端口 + 拉起来要好几秒）。
+// 改成后台排队执行：界面立刻返回，短时间多次改动合并成一次。
+var __gwApplyTimer = null, __gwApplyRunning = false, __gwApplyAgain = false, __gwApplyReason = "", __gwPending = false;
+function scheduleGwApply(reason) {
+    __gwApplyReason = String(reason || "");
+    __gwPending = true;
+    try { if (__gwApplyTimer) clearTimeout(__gwApplyTimer); } catch (eC1) { }
+    __gwApplyTimer = setTimeout(function () {
+        __gwApplyTimer = null;
+        if (__gwApplyRunning) { __gwApplyAgain = true; return; }
+        __gwApplyRunning = true;
+        __gwPending = false;
+        var t0 = Date.now();
+        Promise.resolve().then(function () { return ensureGateway(); })
+            .then(function () { return rlog("GW_APPLY_DONE " + __gwApplyReason + " " + (Date.now() - t0) + "ms"); })
+            .catch(function (eA) { return rlog("GW_APPLY_ERR " + errText(eA)); })
+            .then(function () {
+                __gwApplyRunning = false;
+                if (__gwApplyAgain) { __gwApplyAgain = false; scheduleGwApply(__gwApplyReason); }
+            });
+    }, 400);
+    return Promise.resolve(null);
 }
 
 async function restore() {
@@ -1736,6 +1916,11 @@ async function restore() {
         })();
         await rlog("START gen=" + gen + " accounts=" + state.accounts.length);
         try { await __ensureMediaWorker(); } catch (eMw) { await rlog("MEDIA_WORKER_BOOT_ERR " + errText(eMw)); }
+        // [fix] 基线必须在这里记，不能等到通道都启动完再记。
+        // 原来放在 for 之后：微信 tick / QQ 长连接在 for 里就已经跑起来了，
+        // 启动瞬间进来的消息会被算进基线，于是「重启前那条已经生成、还没送出去」的
+        // 回复索引小于基线，__sweepOne 直接 return，永远补不回来。
+        try { await __sweepCaptureBase(false); } catch (eBS0) { }
         for (var j = 0; j < state.accounts.length; j++) {
             var acc = state.accounts[j];
             try {
@@ -1750,9 +1935,8 @@ async function restore() {
                 else await rlog("CH_UNSUPPORTED " + (acc.cfg.name || "?") + " channel=" + ch);
             } catch (e) { await rlog("ACC_ERR " + (acc.cfg && acc.cfg.name) + " " + errText(e)); }
         }
-        // [fix] 先记录基线（此刻已有多少条消息），之后只补基线之后新增的，
-        // 避免把历史回复当成「未送达」重发一遍。
-        try { await __sweepCaptureBase(); } catch (eBS) { }
+        // 通道都起来之后再补一次，只补前面没拿到 chatId 的账号（避免漏记基线）
+        try { await __sweepCaptureBase(true); } catch (eBS) { await rlog("SWEEP_BASE_ERR " + errText(eBS)); }
         // [fix] 启动后延迟几秒做一次补发扫描：上次若在「正文已生成、还没送出去」
         // 的时候被重启，这里会把它补发到 QQ/微信。
         try {
@@ -1766,13 +1950,28 @@ function stop(killGateway) {
     var _stopNames = [];
     for (var i = 0; i < state.accounts.length; i++) {
         var a = state.accounts[i];
-        if (a.runtime) a.runtime.running = false;
+        if (a.runtime) {
+            a.runtime.running = false;
+            // [fix] 以前只把 running 置 false，WebSocket 从不关闭：每次重载都多留一条
+            // 在线连接且不再 read，平台把事件推给那条旧连接，表现就是「消息收不到」。
+            try { void qqStop(a.runtime); } catch (eQs) { }
+        }
         if (a.cfg && a.cfg.name) _stopNames.push(a.cfg.name);
     }
+    // 重连产生的 runtime 不在 state.accounts 里，这里按登记表再扫一遍，保证连接真的关掉
+    try {
+        var _live = __qqLive.slice(); __qqLive = [];
+        for (var _li = 0; _li < _live.length; _li++) { try { void qqStop(_live[_li]); } catch (eQl) { } }
+    } catch (eQl2) { }
     state.accounts = [];
     // [fix] 停止时把 run 标记清零，否则状态页会显示「运行中」最长 5 分钟
     if (_stopNames.length) { try { void markRunClear(_stopNames); } catch (eRc) { } }
-    if (killGateway) { __wxPollStarted = false; try { void __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && if [ -f wxpoll.pid ] && kill -0 $(cat wxpoll.pid) 2>/dev/null; then kill $(cat wxpoll.pid) 2>/dev/null; fi; rm -f wxpoll.pid"); } catch (eKw) { } try { void __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub && if [ -f gw.pid ] && kill -0 $(cat gw.pid) 2>/dev/null; then kill $(cat gw.pid) 2>/dev/null; fi; rm -f gw.pid"); } catch (e) {} }
+    if (killGateway) {
+        __wxPollStarted = false;
+        // 按进程名杀，pid 文件经常对不上（每次重启都会换），漏杀会让插件停用后端口还开着
+        try { void __termExec("cd /storage/emulated/0/Download/Operit/bridge_hub; ( [ -f wxpoll.pid ] && kill -9 $(cat wxpoll.pid) 2>/dev/null ); rm -f wxpoll.pid; pkill -9 -f 'wxpoll[.]py' 2>/dev/null; sleep 0.3; echo WX_KILLED"); } catch (eKw) { }
+        try { void gwKillAll(); } catch (e) { }
+    }
     void rlog("STOP");
     try { void __flushLog(); } catch (eF) { }
 }
@@ -1812,7 +2011,6 @@ async function statusSnapshot() {
             allowPublic: !!(ce && ce.allowPublic) || !!aj.allowPublic,
             expose: gwExposeOf({ expose: (ce && ce.expose) || aj.expose, allowPublic: !!(ce && ce.allowPublic) || !!aj.allowPublic }),
             waifuSplit: !!(ce && ce.waifuSplit),
-            groupAll: !!(ce && ce.groupAll),
             baseUrl: (ce && ce.baseUrl) || aj.baseUrl || "",
             hasToken: !!tok,
             appSecretSet: !!aj.appSecret,
@@ -1828,6 +2026,7 @@ async function statusSnapshot() {
         });
     }
     return { running: state.running, gen: state.gen, accountCount: list.length, indexList: names,
+        gwApplying: !!__gwApplying, gwPending: !!__gwPending,
         uiKind: __UI_KIND, uiKeys: __UI_KEYS, uiHasDefault: __UI_HAS_DEFAULT, uiErr: __UI_ERR,
         uiKeysRuntime: state.uiKeys || "",
         received: state.received, replied: state.replied, accounts: list,
@@ -1869,7 +2068,9 @@ async function putCfg(name, patch) {
         cfg.accounts.push(hit);
     }
     for (var k in patch) hit[k] = patch[k];
-    await writeJson(CFG_PATH, cfg);
+    // [fix] 写盘失败时不能假装成功：原来直接忽略返回值，磁盘满/路径不可写时
+    // 界面显示「已保存」，重启后配置却回到旧值。
+    if (!(await writeJson(CFG_PATH, cfg))) await rlog("CFG_WRITE_FAIL putCfg " + name);
     state.cfgOverride = cfg; state.cfg = cfg;
     return hit;
 }
@@ -1878,7 +2079,7 @@ async function rmCfg(name) {
     var out = [];
     for (var i = 0; i < cfg.accounts.length; i++) if (cfg.accounts[i].name !== name) out.push(cfg.accounts[i]);
     cfg.accounts = out;
-    await writeJson(CFG_PATH, cfg);
+    if (!(await writeJson(CFG_PATH, cfg))) await rlog("CFG_WRITE_FAIL rmCfg " + name);
     state.cfgOverride = cfg; state.cfg = cfg;
 }
 async function reload() { stop(); await sleep(200); await restore(); }
@@ -1905,7 +2106,10 @@ async function startOne(name) {
 async function stopOne(name) {
     for (var i = 0; i < state.accounts.length; i++) {
         var a = state.accounts[i];
-        if (a && a.cfg && a.cfg.name === name) { if (a.runtime) a.runtime.running = false; state.accounts.splice(i, 1); await markRun(name, false); return true; }
+        if (a && a.cfg && a.cfg.name === name) {
+            if (a.runtime) { a.runtime.running = false; try { void qqStop(a.runtime); } catch (eQs2) { } }
+            state.accounts.splice(i, 1); await markRun(name, false); return true;
+        }
     }
     return false;
 }
@@ -2025,14 +2229,77 @@ var TRASH_DIR = HUB + "accounts/.trash/";
 var TRASH_IDX = TRASH_DIR + "index.json";
 async function trashLoad() { var a = await readJsonSafe(TRASH_IDX, []); return Array.isArray(a) ? a : []; }
 async function trashSave(a) { return await writeJson(TRASH_IDX, a); }
+
+// 「磁盘上的目录」才是真相，索引只是缓存。
+// 老版本删掉的账号可能只进了目录、没进索引（孤儿），索引里也可能留着已经被清掉的目录。
+// 两边对不上，表现就是「回收站里看不到东西 / 列表和实际不符」。每次读列表时对一遍账。
+// 返回 null 表示「没列出来」（终端不可用/命令失败），和「目录确实是空的」必须区分开：
+// 对账第二步会拿这份列表之外的一切当「目录已不存在」剔掉，把失败当成空会把索引全清空。
+async function trashListDirs() {
+    var out = [];
+    try {
+        var r = await __termExec("ls -1 " + shq(HUB_PY + "accounts/.trash") + " 2>/dev/null");
+        if (!r) return null;
+        var ls = String((r && r.output) || "").split(String.fromCharCode(10));
+        for (var i = 0; i < ls.length; i++) {
+            var t = ls[i].trim();
+            if (!t || t === "index.json") continue;
+            out.push(t);
+        }
+    } catch (e) { return null; }
+    return out;
+}
+
+async function trashReconcile() {
+    var arr = await trashLoad();
+    var seen = {};
+    for (var i = 0; i < arr.length; i++) { if (arr[i] && arr[i].dir) seen[arr[i].dir] = 1; }
+    var changed = false;
+    // 1) 目录有、索引没有 → 补记录（名字和时间从目录名 <name>-<时间戳> 还原）
+    var dirs = await trashListDirs();
+    if (dirs === null) {
+        // 列不出目录就什么都别做：既补不了，也不能往下剔（否则会把索引清空）
+        await rlog("TRASH_LS_FAIL keep=" + arr.length);
+        return arr;
+    }
+    for (var j = 0; j < dirs.length; j++) {
+        var d = dirs[j];
+        if (seen[d]) continue;
+        var m = d.match(/-(\d+)$/);
+        var ts = m ? Number(m[1]) : 0;
+        var nm = m ? d.slice(0, d.length - m[0].length) : d;
+        var aj = await readJsonSafe(TRASH_DIR + d + "/account.json", {});
+        arr.push({ dir: d, name: nm, type: acctType(aj, null), deletedAt: ts, adopted: true });
+        seen[d] = 1; changed = true;
+    }
+    // 2) 索引有、目录没了 → 剔掉，别留死条目
+    var out = [];
+    for (var k = 0; k < arr.length; k++) {
+        var rec = arr[k];
+        if (!rec || !rec.dir) continue;
+        var ex = true;
+        try { ex = await fsExists(TRASH_DIR + rec.dir); } catch (eEx) { ex = true; }
+        if (ex) out.push(rec); else changed = true;
+    }
+    if (changed) {
+        try { await trashSave(out); await rlog("TRASH_RECONCILE n=" + out.length); } catch (e) { }
+    }
+    return out;
+}
 async function softDelete(name, type, extra) {
     try { await Tools.Files.mkdir(TRASH_DIR); } catch (e) {}
     var dir = name + "-" + Date.now();
     var moved = false;
-    try { await Tools.Files.move(HUB + "accounts/" + name, TRASH_DIR + dir); moved = true; }
-    catch (eM) {
-        try { await __termExec("mv " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/" + name) + " " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + dir)); moved = true; } catch (e2) {}
+    // move 失败也可能不抛异常，只把 successful 置 false，所以两种都要看
+    try {
+        var mv1 = await Tools.Files.move(HUB + "accounts/" + name, TRASH_DIR + dir);
+        moved = !(mv1 && mv1.successful === false);
+    } catch (eM) { moved = false; }
+    if (!moved) {
+        try { await __termExec("mv " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/" + name) + " " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + dir)); moved = true; } catch (e2) { moved = false; }
     }
+    // 最后以磁盘为准复核一次
+    if (moved) { try { moved = await fsExists(TRASH_DIR + dir); } catch (e3) { } }
     if (!moved) return false;
     var arr = await trashLoad();
     var rec = { dir: dir, name: name, type: type, deletedAt: Date.now() };
@@ -2065,37 +2332,67 @@ async function handleTool(name, p) {
         if (short === "bridge_clip") {
             var _t = String((p && p.text) || "");
             if (!_t) return { success: false, error: "空内容" };
+            // 平台开放接口 System.setClipboardText（system.d.ts 有声明）。原来只走终端 cmd clipboard，
+            // 多数系统根本没这条命令，于是点了复制没任何反应，还假报成功。
+            try {
+                var _S = (typeof Tools !== "undefined" && Tools && Tools.System) ? Tools.System : null;
+                if (_S && typeof _S.setClipboardText === "function") {
+                    await _S.setClipboardText(_t);
+                    await rlog("CLIP_SET via=api len=" + _t.length);
+                    return { success: true, via: "api" };
+                }
+                await rlog("CLIP_NO_API");
+            } catch (eC) { await rlog("CLIP_API_ERR " + errText(eC)); }
+            // 兜底：老的终端方案，只有极少数环境可用；失败要如实回报，不能再假成功
             try {
                 var _b = b64bytes(Array.prototype.slice.call(new TextEncoder().encode(_t)));
-                await __termExec("echo '" + _b + "' | base64 -d > /data/local/tmp/_clip.txt && cmd clipboard set-text $(cat /data/local/tmp/_clip.txt) 2>/dev/null; rm -f /data/local/tmp/_clip.txt");
-                return { success: true };
+                var _r = await __termExec("echo '" + _b + "' | base64 -d > /data/local/tmp/_clip.txt && cmd clipboard set-text $(cat /data/local/tmp/_clip.txt) 2>/dev/null; rm -f /data/local/tmp/_clip.txt");
+                var _out = String((_r && _r.output) || "");
+                if (!_r || /not found|Unknown|inaccessible|denied/i.test(_out)) {
+                    await rlog("CLIP_TERM_FAIL " + _out.slice(0, 80));
+                    return { success: false, error: "系统没有可用的剪贴板接口" };
+                }
+                return { success: true, via: "term" };
             } catch (e) { var __m = errText(e); if (__m.indexOf("executing") >= 0) __m = "目标对话正在执行中，请等空闲后再试"; return { success: false, error: __m }; }
         }
+        if (short === "bridge_uilog") {
+            await rlog("UI " + String((p && p.msg) || "").slice(0, 200));
+            return { success: true };
+        }
         if (short === "trash_list") {
-            var tl = await trashLoad();
+            var tl = await trashReconcile();
             return { success: true, items: tl, accounts: (await statusSnapshot()).accounts };
         }
         if (short === "trash_restore") {
             var dirs = Array.isArray(p.dirs) ? p.dirs : String(p.dirs || "").split(",").filter(Boolean);
             if (!dirs.length) return { success: false, error: "请先勾选" };
-            var ta = await trashLoad(); var done = []; var renamed = [];
+            var ta = await trashReconcile(); var done = []; var renamed = [];
             for (var ti = 0; ti < ta.length; ti++) {
                 var rec = ta[ti];
                 if (dirs.indexOf(rec.dir) < 0) continue;
                 var target = rec.name;
                 var ex0 = false;
-                try { ex0 = await Tools.Files.exists(HUB + "accounts/" + target); } catch (eX0) { ex0 = false; }
+                try { ex0 = await fsExists(HUB + "accounts/" + target); } catch (eX0) { ex0 = false; }
                 if (ex0) {
                     for (var n2 = 1; n2 < 100; n2++) {
                         target = rec.name + " (" + n2 + ")";
                         var ex1 = false;
-                        try { ex1 = await Tools.Files.exists(HUB + "accounts/" + target); } catch (eX1) { ex1 = false; }
+                        try { ex1 = await fsExists(HUB + "accounts/" + target); } catch (eX1) { ex1 = false; }
                         if (!ex1) break;
                     }
                 }
-                try { await Tools.Files.move(TRASH_DIR + rec.dir, HUB + "accounts/" + target); } catch (eR) {
-                    try { await __termExec("mv " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + rec.dir) + " " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/" + target)); } catch (eR2) { continue; }
+                var _mvR = false;
+                try {
+                    var _mvRes = await Tools.Files.move(TRASH_DIR + rec.dir, HUB + "accounts/" + target);
+                    _mvR = !(_mvRes && _mvRes.successful === false);
+                } catch (eR) { _mvR = false; }
+                if (!_mvR) {
+                    try { await __termExec("mv " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + rec.dir) + " " + shq("/storage/emulated/0/Download/Operit/bridge_hub/accounts/" + target)); _mvR = true; } catch (eR2) { _mvR = false; }
                 }
+                if (_mvR) { try { _mvR = await fsExists(HUB + "accounts/" + target); } catch (eR3) { } }
+                // 目录没真移过去就不能继续改 account.json / 索引，否则账号会变成空壳，
+                // 而且下面会把回收站记录 splice 掉，等于数据永久丢失。
+                if (!_mvR) { await rlog("TRASH_RESTORE_MOVE_FAIL " + rec.dir + " -> " + target); continue; }
                 try {
                     var aj9 = await readJsonSafe(HUB + "accounts/" + target + "/account.json", {});
                     if (aj9 && typeof aj9 === "object") { aj9.name = target; await writeJson(HUB + "accounts/" + target + "/account.json", aj9); }
@@ -2116,19 +2413,19 @@ async function handleTool(name, p) {
         if (short === "trash_purge") {
             var dirs2 = Array.isArray(p.dirs) ? p.dirs : String(p.dirs || "").split(",").filter(Boolean);
             if (!dirs2.length) return { success: false, error: "请先勾选" };
-            var tb = await trashLoad(); var left = []; var gone = [];
+            var tb = await trashReconcile(); var left = []; var gone = [];
             for (var tj = 0; tj < tb.length; tj++) {
                 var r2 = tb[tj];
                 if (dirs2.indexOf(r2.dir) < 0) { left.push(r2); continue; }
                 var full = "/storage/emulated/0/Download/Operit/bridge_hub/accounts/.trash/" + r2.dir;
                 // [fix] 删除失败也把记录从索引里删掉，会留下永远看不到、也删不掉的孤儿目录
                 var _delOk = false;
-                try { await Tools.Files.deleteFile(full); _delOk = true; } catch (e1) {
-                    try { await Tools.Files.delete(full); _delOk = true; } catch (e2) {
+                try { await Tools.Files.deleteFile(full, true); _delOk = true; } catch (e1) {
+                    try { await Tools.Files.deleteFile(full); _delOk = true; } catch (e2) {
                         try { await __termExec("rm -rf " + shq(full)); } catch (e3) { }
                     }
                 }
-                try { var _still = await Tools.Files.exists(full); _delOk = !_still; } catch (e4) { }
+                try { _delOk = !(await fsExists(full)); } catch (e4) { }
                 if (!_delOk) { left.push(r2); continue; }
                 gone.push(r2.name);
             }
@@ -2146,7 +2443,7 @@ async function handleTool(name, p) {
             }
             return { success: false, error: "unknown action" };
         }
-        if (short === "bridge_ui") { state.uiKeys = String((p && p.keys) || ""); await rlog("UI_KEYS " + state.uiKeys.slice(0, 200)); return { success: true }; }
+        if (short === "bridge_ui") { state.uiKeys = String((p && p.keys) || ""); await rlog("UI_KEYS " + state.uiKeys.slice(0, 900)); return { success: true }; }
 
         if (short === "bridge_accounts") {
             var action = String(p.action || "list");
@@ -2176,12 +2473,19 @@ async function handleTool(name, p) {
                 var st2 = await statusSnapshot(); st2.success = true; return st2;
             }
             if (action === "remove") {
-                var ix2 = await indexList(); var o = [];
-                for (var i = 0; i < ix2.length; i++) if (ix2[i] !== nm) o.push(ix2[i]);
-                await setIndex(o); await rmCfg(nm); await stopOne(nm);
+                // [fix] 顺序原来是「先摘索引 → 删配置 → 停账号 → 最后才移目录」，
+                // 两个问题：① cfgOf 在 rmCfg 之后调用，读到的已经是空配置，
+                // 回收站记录丢掉 chatId / port；② 移目录一旦失败，索引和配置都没了，
+                // 目录却还躺在 accounts 下，变成谁也管不到的孤儿账号。
+                // 现在改成「先移目录，移成功才摘索引删配置」，失败就整体中止。
                 var _aj = await readJsonSafe(HUB + "accounts/" + nm + "/account.json", {});
                 var _ce = await cfgOf(nm);
-                await softDelete(nm, acctType(_aj, _ce), { chatId: (_ce && _ce.chatId) || "", port: (_ce && _ce.port) || 0 });
+                var _sd = await softDelete(nm, acctType(_aj, _ce), { chatId: (_ce && _ce.chatId) || "", port: (_ce && _ce.port) || 0 });
+                if (!_sd) return { success: false, error: "删除失败：目录没有移进回收站，账号保持原样" };
+                await stopOne(nm);
+                var ix2 = await indexList(); var o = [];
+                for (var i = 0; i < ix2.length; i++) if (ix2[i] !== nm) o.push(ix2[i]);
+                await setIndex(o); await rmCfg(nm);
                 void reload();
                 var st3 = await statusSnapshot(); st3.success = true; return st3;
             }
@@ -2190,16 +2494,13 @@ async function handleTool(name, p) {
                 if (!nn) return { success: false, error: "缺少 new_name" };
                 var _dup = await readJsonSafe(HUB + "accounts/" + nn + "/account.json", null);
                 if (_dup) return { success: false, error: "目标账号已存在：" + nn };
-                var ix3 = await indexList();
-                for (var q = 0; q < ix3.length; q++) if (ix3[q] === nm) ix3[q] = nn;
-                await setIndex(ix3);
-                // [fix] 原先用 void 异步发出去就继续改配置，mv 失败（目标已存在、权限等）
-                // 会导致配置指向新名字、目录还在旧名字，账号直接失联。
-                // 这里改为等它执行完并核对目录是否真的移过去了。
+                // [fix] 原先是「先改索引 → 再 mv → 失败就 return」，mv 失败时索引已经
+                // 指向新名字、目录还在旧名字，账号当场失联且回不去。
+                // 现在改成「先 mv → 核对 → 成功后才改索引和配置」。
                 var _mvOk = false;
                 try {
                     await __termExec("cd /sdcard/Download/Operit/bridge_hub/accounts && mv " + shq(nm) + " " + shq(nn));
-                    try { _mvOk = await Tools.Files.exists(HUB + "accounts/" + nn); } catch (eX) { _mvOk = false; }
+                    try { _mvOk = await fsExists(HUB + "accounts/" + nn); } catch (eX) { _mvOk = false; }
                 } catch (e) { _mvOk = false; }
                 if (!_mvOk) return { success: false, error: "重命名失败：目录没有移动成功" };
                 var ce0 = await cfgOf(nm);
@@ -2209,6 +2510,9 @@ async function handleTool(name, p) {
                 if (ce0 && ce0.token) keep.token = ce0.token;
                 if (ce0 && ce0.baseUrl) keep.baseUrl = ce0.baseUrl;
                 await stopOne(nm); await rmCfg(nm); await putCfg(nn, keep);
+                var ix3 = await indexList();
+                for (var q = 0; q < ix3.length; q++) if (ix3[q] === nm) ix3[q] = nn;
+                await setIndex(ix3);
                 void reload();
                 var st4 = await statusSnapshot(); st4.success = true; return st4;
             }
@@ -2256,11 +2560,25 @@ async function handleTool(name, p) {
             else if (raw && typeof raw === "object") obj = raw;
             var cur = await readJsonSafe(HUB + "accounts/" + ac3 + "/account.json", {});
             for (var kk in obj) cur[kk] = obj[kk];
-            await writeJson(HUB + "accounts/" + ac3 + "/account.json", cur);
+            // [fix] 写盘失败必须让界面知道：原来忽略返回值，account.json 没写进去，
+            // 下面的 putCfg 却把新值写进了 rt_config，两处不一致，重启后配置又变回去。
+            if (!(await writeJson(HUB + "accounts/" + ac3 + "/account.json", cur))) {
+                await rlog("ACC_WRITE_FAIL " + ac3);
+                return { success: false, error: "账号配置写入失败，请重试" };
+            }
             var patch = {};
-            if (cur.port) patch.port = Number(cur.port);
+            // [fix] 端口不能在后台随便转：前端有 1024-65535 校验，这里也必须挡一次，
+            // 否则 Number("abc") 得到 NaN，序列化进 gw_ports.json 会把网关配置搞坏。
+            if (cur.port) {
+                var _pn2 = Number(cur.port);
+                if (_pn2 >= 1024 && _pn2 <= 65535) patch.port = _pn2;
+                else await rlog("PORT_INVALID " + ac3 + " " + String(cur.port));
+            }
             if (cur.baseUrl) patch.baseUrl = cur.baseUrl;
-            if (cur.token) patch.token = cur.token;
+            // [fix] 原来是 if (cur.token)：令牌被清成空串时这个条件为假，
+            // patch 里根本不放 token，rt_config 保留旧密钥，于是「界面上令牌清空了、
+            // 网关还在用旧的」。改成只要字段存在就同步（空串也同步）。
+            if (cur.token !== undefined) patch.token = String(cur.token || "");
             if (cur.type) patch.channel = cfgChannel(cur.type);
             if (cur.allowPublic !== undefined) patch.allowPublic = !!cur.allowPublic;
             if (cur.expose !== undefined) {
@@ -2269,12 +2587,15 @@ async function handleTool(name, p) {
                 patch.allowPublic = (patch.expose === "public");
             }
             if (cur.waifuSplit !== undefined) patch.waifuSplit = !!cur.waifuSplit;
-            if (cur.groupAll !== undefined) patch.groupAll = !!cur.groupAll;
             await putCfg(ac3, patch);
-            if (patch.port || patch.allowPublic !== undefined || patch.expose !== undefined || patch.token !== undefined) { try { await ensureGateway(); } catch (eG3) {} }
-            // 这几个开关是运行时读 cfg 的，改完必须重启账号才生效，否则界面显示变了、行为没变。
-            if (cur.expose !== undefined || cur.waifuSplit !== undefined || cur.groupAll !== undefined) {
-                try { await stopOne(ac3); await startOne(ac3); } catch (eRs) { await rlog("CFG_RESTART_ERR " + ac3 + " " + errText(eRs)); }
+            // 网关重启是慢活（杀进程 + 等端口释放 + 重新拉起），丢到后台做，界面立刻能点
+            if (patch.port || patch.allowPublic !== undefined || patch.expose !== undefined || patch.token !== undefined) { await scheduleGwApply("cfg"); }
+            // expose 只影响网关监听，账号本身不用重启；这两个开关是账号运行时读的，必须重启账号。
+            if (cur.waifuSplit !== undefined) {
+                var _acR = ac3;
+                Promise.resolve().then(function () { return stopOne(_acR); })
+                    .then(function () { return startOne(_acR); })
+                    .catch(function (eRs) { return rlog("CFG_RESTART_ERR " + _acR + " " + errText(eRs)); });
             }
             var stc = await statusSnapshot(); stc.success = true; return stc;
         }
@@ -2296,13 +2617,28 @@ async function handleTool(name, p) {
             var isPub4 = (ce4 && ce4.channel === "http") || aj4.type === "public";
             if (!isPub4) return { success: false, error: "只有「公开接口」账号需要密钥，微信账号不需要" };
             var cur2 = await readJsonSafe(HUB + "accounts/" + ac4 + "/account.json", {});
-            if (p.clear) { cur2.token = ""; cur2.accessToken = ""; await writeJson(HUB + "accounts/" + ac4 + "/account.json", cur2); await putCfg(ac4, { token: "" }); try { await ensureGateway(); } catch (eG1) { } return { success: true, token: "" }; }
+            if (p.clear) {
+                cur2.token = ""; cur2.accessToken = "";
+                await writeJson(HUB + "accounts/" + ac4 + "/account.json", cur2);
+                await putCfg(ac4, { token: "" });
+                // 没有密钥就不能对外：档位一并降回本机，否则界面显示「公网」、网关其实只绑回环，状态看着对实际不对
+                var _ce5 = await cfgOf(ac4);
+                if (_ce5 && gwExposeOf(_ce5) !== "local") {
+                    await putCfg(ac4, { expose: "local", allowPublic: false });
+                    await rlog("TOKEN_CLEAR_FORCE_LOCAL " + ac4);
+                }
+                await scheduleGwApply("token-clear");
+                return { success: true, token: "", expose: "local" };
+            }
             var hex = "0123456789abcdef", key = "sk-";
             for (var z2 = 0; z2 < 48; z2++) key += hex.charAt(Math.floor(Math.random() * 16));
             cur2.token = key; if (!cur2.type) cur2.type = "public";
-            await writeJson(HUB + "accounts/" + ac4 + "/account.json", cur2);
+            if (!(await writeJson(HUB + "accounts/" + ac4 + "/account.json", cur2))) {
+                await rlog("ACC_WRITE_FAIL token " + ac4);
+                return { success: false, error: "新密钥写入失败，请重试" };
+            }
             await putCfg(ac4, { token: key });
-            try { await ensureGateway(); } catch (eG2) { }
+            await scheduleGwApply("token-new");
             return { success: true, account: ac4, token: key };
         }
         if (short === "bridge_list_chats") {
