@@ -282,8 +282,18 @@ function Screen(ctx) {
             errState.set("测试异常：" + String(e && e.message ? e.message : e));
         });
     }
-    function opSetAllowPublic(a, v) {
-        return call("bridge_core:bridge_config", { account: a.name, config: JSON.stringify({ allowPublic: !!v }) }, v ? "已允许非局域网访问" : "已限制为局域网").then(refresh);
+    function opSetExpose(a, mode) {
+        const m = String(mode || "local");
+        if (m !== "local" && !a.tokenReady) {
+            errState.set("请先生成访问令牌，再开放局域网或公网访问");
+            try { TOAST("缺少密钥：先点「随机生成」拿一个令牌"); } catch (_e) {}
+            return Promise.resolve(null);
+        }
+        const txt = m === "local" ? "已改为仅本机访问" : (m === "lan" ? "已允许局域网访问（需密钥）" : "已允许公网访问（需密钥）");
+        return call("bridge_core:bridge_config", { account: a.name, config: JSON.stringify({ expose: m }) }, txt).then(refresh);
+    }
+    function opSetOption(a, patch) {
+        return call("bridge_core:bridge_config", { account: a.name, config: JSON.stringify(patch) }, "已保存").then(refresh);
     }
     function opRegenToken(a) {
         return call("bridge_core:bridge_token", { account: a.name }, "已生成新令牌").then(function (p) {
@@ -594,13 +604,24 @@ function Screen(ctx) {
                     singleLine: true,
                     keyboardType: "number"
                 }));
-                d.push(ctx.UI.Row({ verticalAlignment: "center", spacing: 8 }, [
-                    TXT({ text: "允许非局域网访问", style: "bodyMedium", weight: 1 }),
-                    ctx.UI.Switch({ checked: !!a.allowPublic, onCheckedChange: function (v) { return opSetAllowPublic(a, v); } })
+                d.push(TXT({ text: "监听范围", style: "bodyMedium", fontWeight: "bold" }));
+                const _exp = a.expose || "local";
+                d.push(ctx.UI.Row({ spacing: 6 }, [
+                    BTN({ weight: 1, onClick: function () { return opSetExpose(a, "local"); } }, [TXT({ text: (_exp === "local" ? "✓ " : "") + "仅本机" })]),
+                    BTN({ weight: 1, onClick: function () { return opSetExpose(a, "lan"); } }, [TXT({ text: (_exp === "lan" ? "✓ " : "") + "局域网" })]),
+                    BTN({ weight: 1, onClick: function () { return opSetExpose(a, "public"); } }, [TXT({ text: (_exp === "public" ? "✓ " : "") + "公网" })])
                 ]));
-                d.push(TXT({ text: a.allowPublic ? "已开放：任何能访问此端口的外网 IP 都可调用" : "仅限本机与局域网", style: "labelSmall", color: a.allowPublic ? "error" : "onSurfaceVariant" }));
+                d.push(TXT({
+                    text: _exp === "local"
+                        ? "只监听 127.0.0.1，手机以外的设备连不进来（推荐）"
+                        : (_exp === "lan" ? "监听 0.0.0.0，同一局域网内可访问，必须带密钥" : "监听 0.0.0.0，任何能连上来的 IP 都可访问，必须带密钥"),
+                    style: "labelSmall", color: _exp === "public" ? "error" : "onSurfaceVariant"
+                }));
+                if (_exp !== "local" && !a.tokenReady) {
+                    d.push(TXT({ text: "⚠ 还没配密钥：这种状态下网关会退回只监听本机，先生成访问令牌再开放", style: "labelSmall", color: "error" }));
+                }
                 var _apiUrl = "http://127.0.0.1:" + (e.port || a.port || 8789) + "/v1";
-                d.push(TXT({ text: "接口地址：" + _apiUrl + "（把 127.0.0.1 换成手机局域网 IP 即可给外部用）", style: "labelSmall", color: "onSurfaceVariant" }));
+                d.push(TXT({ text: "接口地址：" + _apiUrl + (_exp === "local" ? "（仅本机可调用）" : "（把 127.0.0.1 换成手机局域网 IP）"), style: "labelSmall", color: "onSurfaceVariant" }));
                 d.push(BTN({ onClick: function () { return opCopy(_apiUrl); } }, [TXT({ text: "复制接口地址" })]));
                 if (a.tokenReady) {
                     var _rv = revealState.value;
@@ -626,6 +647,26 @@ function Screen(ctx) {
                         BTN({ weight: 1, onClick: function () { setEd(a.name, { token: "" }); } }, [TXT({ text: "清除" })])
                     ]));
                 }
+            }
+
+            d.push(TXT({ text: "── 回复与接收 ──", style: "labelMedium", color: "primary" }));
+            d.push(ctx.UI.Row({ verticalAlignment: "center", spacing: 8 }, [
+                TXT({ text: "Waifu 切条（按插件分句发送）", style: "bodyMedium", weight: 1 }),
+                ctx.UI.Switch({ checked: a.waifuSplit === true, onCheckedChange: function (v) { return opSetOption(a, { waifuSplit: !!v }); } })
+            ]));
+            d.push(TXT({
+                text: a.waifuSplit ? "已开启：回复交给 Waifu 模式插件切句，逐条气泡发送；没装或调用失败时自动回退" : "已关闭：只有超过 1500 字时才按标点机械切分",
+                style: "labelSmall", color: "onSurfaceVariant"
+            }));
+            if (a.type === "qq") {
+                d.push(ctx.UI.Row({ verticalAlignment: "center", spacing: 8 }, [
+                    TXT({ text: "接收全部群消息（关闭＝仅 @ 我）", style: "bodyMedium", weight: 1 }),
+                    ctx.UI.Switch({ checked: a.groupAll === true, onCheckedChange: function (v) { return opSetOption(a, { groupAll: !!v }); } })
+                ]));
+                d.push(TXT({
+                    text: a.groupAll ? "已开启：群里没 @ 我的消息也会进对话（需平台已给全量消息权限）" : "只回 @ 我 的群消息，其余直接丢弃",
+                    style: "labelSmall", color: "onSurfaceVariant"
+                }));
             }
 
             d.push(TXT({ text: "── 对话绑定 ──", style: "labelMedium", color: "primary" }));
